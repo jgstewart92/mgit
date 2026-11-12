@@ -1,0 +1,3 @@
+[submodule "synth/notice/sub"]
+	path = synth/notice/sub
+	url = https://example.com/synthetic/sub.git
