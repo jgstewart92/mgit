@@ -24,12 +24,15 @@ static const char *const kind_name[R_KINDS] = { "secret", "private", "allow", "b
 
 struct rule {
 	int kind, line;
+	int empty;	/* it matches the empty string */
 	regex_t re;
+	regex_t re_nl;	/* secret and private rules: the same, with REG_NEWLINE, for scan_text's search over many lines */
 };
 
 struct ck {
 	struct rule *r;
 	size_t nr;
+	int any_empty;	/* a secret or private rule matches the empty string */
 	uint64_t warn_size, max_size;
 	size_t subject;
 	const char *file;
@@ -200,7 +203,12 @@ static int load_rules(struct ck *ck)
 			bad = 1;
 			continue;
 		}
+		if ((k == R_SECRET || k == R_PRIVATE) && regcomp(&ck->r[ck->nr].re_nl, v, flags | REG_NEWLINE))
+			die("cannot compile %s:%d a second time", ck->file, ln);
 		ck->r[ck->nr].kind = k;
+		ck->r[ck->nr].empty = !regexec(&ck->r[ck->nr].re, "", 0, NULL, 0);
+		if (ck->r[ck->nr].empty && (k == R_SECRET || k == R_PRIVATE))
+			ck->any_empty = 1;
 		ck->r[ck->nr++].line = ln;
 	}
 	buf_free(&b);
@@ -221,50 +229,76 @@ static void put_clipped(buf *out, const char *s, size_t n)
 		buf_adds(out, "...");
 }
 
+/* Whether rule r has a match in s[0, n) (which holds no NUL) that no allow rule covers, judged on "WHERE: MATCH". */
+static int seg_hit(const struct ck *ck, const struct rule *r, const char *where, size_t lineno, const char *s, size_t n,
+		   buf *key)
+{
+	size_t off = 0;
+	regmatch_t m;
+	int eflags = 0;
+
+	if (!n && !r->empty)
+		return 0;
+	for (;;) {
+		m.rm_so = 0;
+		m.rm_eo = (regoff_t)(n - off);
+		if (regexec(&r->re, s + off, 1, &m, eflags | REG_STARTEND))
+			return 0;
+		key->len = 0;
+		if (lineno)
+			buf_printf(key, "%s:%zu: ", where, lineno);
+		else
+			buf_printf(key, "%s: ", where);
+		buf_add(key, s + off + m.rm_so, (size_t)(m.rm_eo - m.rm_so));
+		if (!allowed(ck, (char *)key->p))
+			return 1;
+		off += (size_t)(m.rm_eo > m.rm_so ? m.rm_eo : m.rm_so + 1);
+		eflags = REG_NOTBOL;
+		if (off > n)
+			return 0;
+	}
+}
+
 /*
  * The secret and private rules over one line (cut at NULs, as a binary file's strings are). A rule hits when it has a
- * match no allow rule covers, judged on "WHERE: MATCH"; the line is printed once, with every rule that hit it.
+ * match no allow rule covers, judged on "WHERE: MATCH"; the line is printed once, with every rule that hit it. Each
+ * piece between NULs is searched where it lies (REG_STARTEND), and the empty pieces of a run of NULs only by the
+ * rules that match an empty string, so a line of millions of NULs costs no more than reading it.
  */
 static void scan_line(struct ck *ck, const char *where, size_t lineno, const char *s, size_t n)
 {
-	buf seg = { 0 }, key = { 0 }, rules = { 0 };
-	size_t a = 0, i;
+	buf key = { 0 }, rules = { 0 };
+	size_t a = 0, i, left = 0;
+	char *hit = calloc(ck->nr + 1, 1);
 
-	for (i = 0; i < ck->nr; i++) {
-		const struct rule *r = &ck->r[i];
-		int hit = 0;
+	if (!hit)
+		die("out of memory");
+	for (i = 0; i < ck->nr; i++)
+		left += ck->r[i].kind == R_SECRET || ck->r[i].kind == R_PRIVATE;
+	while (a <= n && left) {
+		const char *nul = a < n ? memchr(s + a, 0, n - a) : NULL;
+		size_t b = nul ? (size_t)(nul - s) : n;
 
-		if (r->kind != R_SECRET && r->kind != R_PRIVATE)
-			continue;
-		for (a = 0; a <= n && !hit; a++) {
-			size_t b = a, off = 0;
-			regmatch_t m;
-			int eflags = 0;
+		if (b > a || ck->any_empty)
+			for (i = 0; i < ck->nr; i++) {
+				const struct rule *r = &ck->r[i];
 
-			while (b < n && s[b])
-				b++;
-			seg.len = 0;
-			buf_add(&seg, s + a, b - a);
-			while (off <= seg.len && !regexec(&r->re, (char *)seg.p + off, 1, &m, eflags)) {
-				key.len = 0;
-				if (lineno)
-					buf_printf(&key, "%s:%zu: ", where, lineno);
-				else
-					buf_printf(&key, "%s: ", where);
-				buf_add(&key, seg.p + off + m.rm_so, (size_t)(m.rm_eo - m.rm_so));
-				off += (size_t)(m.rm_eo > m.rm_so ? m.rm_eo : m.rm_so + 1);
-				eflags = REG_NOTBOL;
-				if (!allowed(ck, (char *)key.p)) {
-					hit = 1;
-					break;
+				if ((r->kind != R_SECRET && r->kind != R_PRIVATE) || hit[i])
+					continue;
+				if (seg_hit(ck, r, where, lineno, s + a, b - a, &key)) {
+					hit[i] = 1;
+					left--;
 				}
 			}
-			a = b;
-		}
-		if (hit) {
-			buf_printf(&rules, "%s%s:%d", rules.len ? "," : "", kind_name[r->kind], r->line);
-		}
+		a = b + 1;
+		if (!ck->any_empty)
+			while (a < n && !s[a])
+				a++;
 	}
+	for (i = 0; i < ck->nr; i++)
+		if (hit[i])
+			buf_printf(&rules, "%s%s:%d", rules.len ? "," : "", kind_name[ck->r[i].kind], ck->r[i].line);
+	free(hit);
 	if (rules.len) {
 		buf text = { 0 };
 
@@ -276,25 +310,67 @@ static void scan_line(struct ck *ck, const char *where, size_t lineno, const cha
 		emit(ck, 1, (char *)rules.p, (char *)text.p);
 		buf_free(&text);
 	}
-	buf_free(&seg);
 	buf_free(&key);
 	buf_free(&rules);
 }
 
+/*
+ * Every line through scan_line, except lines no rule can hit. Over a run of lines with no NUL in it, each rule is
+ * searched once with REG_NEWLINE (^ and $ at every line end, . never across one) for its next match; a line before
+ * every rule's next match has no match of its own, since a match within one line is also a match in the run. Only
+ * the lines a next match starts on, and lines holding a NUL, are scanned line by line, so the result is the same as
+ * scanning each line, at one search per rule and hit instead of one per rule and line.
+ */
 static void scan_text(struct ck *ck, const char *where, const unsigned char *p, size_t n, int crlf)
 {
-	size_t lineno = 1, a = 0, cr = 0, first_cr = 0;
+	size_t lineno = 1, a = 0, cr = 0, first_cr = 0, run_end = 0, i;
+	size_t *next = xmalloc((ck->nr + 1) * sizeof *next);
+	char *known = xmalloc(ck->nr + 1);
 
 	while (a < n) {
 		const unsigned char *nl = memchr(p + a, '\n', n - a);
 		size_t b = nl ? (size_t)(nl - p) : n;
+		int dirty = 0;
 
 		if (crlf && b > a && p[b - 1] == '\r' && !cr++)
 			first_cr = lineno;
-		scan_line(ck, where, lineno, (const char *)p + a, b - a);
+		if (a >= run_end) {
+			const unsigned char *z = memchr(p + a, 0, n - a);
+
+			run_end = n;
+			if (z) {
+				while (z > p + a && z[-1] != '\n')
+					z--;
+				run_end = (size_t)(z - p);
+			}
+			memset(known, 0, ck->nr + 1);
+		}
+		if (a >= run_end) {
+			dirty = 1;
+		} else {
+			for (i = 0; i < ck->nr && !dirty; i++) {
+				const struct rule *r = &ck->r[i];
+				regmatch_t m;
+
+				if (r->kind != R_SECRET && r->kind != R_PRIVATE)
+					continue;
+				if (!known[i] || (next[i] != SIZE_MAX && next[i] < a)) {
+					m.rm_so = 0;
+					m.rm_eo = (regoff_t)(run_end - a);
+					next[i] = regexec(&r->re_nl, (const char *)p + a, 1, &m, REG_STARTEND) ? SIZE_MAX :
+						  a + (size_t)m.rm_so;
+					known[i] = 1;
+				}
+				dirty = next[i] <= b;
+			}
+		}
+		if (dirty)
+			scan_line(ck, where, lineno, (const char *)p + a, b - a);
 		a = b + 1;
 		lineno++;
 	}
+	free(next);
+	free(known);
 	if (cr)
 		report(ck, 1, "crlf", NULL, "%s:%zu: CR LF line ending%s (%zu line%s)", where, first_cr, cr > 1 ? "s" : "", cr,
 		       cr > 1 ? "s" : "");
@@ -434,8 +510,19 @@ static void check_tree(struct ck *ck, const unsigned char tree[20], const char *
 		path.len = 0;
 		buf_adds(&path, prefix);
 		buf_adds(&path, name);
-		if (link)
+		if (link) {
+			unsigned char pk[20];
+			char hex[41];
+
+			object_hash(OBJ_BLOB, path.p, path.len, pk);
+			if (idset_add(&ck->paths_done, pk)) {
+				scan_line(ck, (char *)path.p, 0, (char *)path.p, path.len);
+				id_to_hex(eid, hex);
+				report(ck, 0, "submodule", NULL, "%s: a submodule entry (commit %.7s); its own commits are not in this "
+				       "push and are not checked", (char *)path.p, hex);
+			}
 			continue;
+		}
 		if (dir) {
 			int ign = ign_dir || ignore_match(&ck->ig, (char *)path.p, 1);
 
@@ -556,14 +643,22 @@ int check_run(const struct objlist *objs, const struct check_ref *refs, size_t n
 			buf_adds(&where, ck.path[i]);
 		else
 			buf_printf(&where, "(blob %s)", sh);
-		if (b.len > ck.max_size)
+		/* binary as git decides it: a NUL in the first 8000 bytes; such a file gets the size and name rules only */
+		binary = memchr(b.p, 0, b.len < 8000 ? b.len : 8000) != NULL;
+		if (b.len > ck.max_size) {
+			/* refused for its size; its text is not read */
 			report(&ck, 1, "size", NULL, "%s: %zu bytes, over the limit of %llu (max-size)", (char *)where.p, b.len,
 			       (unsigned long long)ck.max_size);
-		else if (b.len > ck.warn_size)
-			report(&ck, 0, "size", NULL, "%s: %zu bytes, over %llu (warn-size)", (char *)where.p, b.len,
-			       (unsigned long long)ck.warn_size);
-		binary = memchr(b.p, 0, b.len < 8000 ? b.len : 8000) != NULL;
-		scan_text(&ck, (char *)where.p, b.p, b.len, !binary);
+		} else {
+			if (b.len > ck.warn_size)
+				report(&ck, 0, "size", NULL, "%s: %zu bytes, over %llu (warn-size)", (char *)where.p, b.len,
+				       (unsigned long long)ck.warn_size);
+			if (!binary)
+				scan_text(&ck, (char *)where.p, b.p, b.len, 1);
+			if (!binary && is_lfs_pointer(&b))
+				report(&ck, 0, "lfs", NULL, "%s: a Git LFS pointer; the content it names is not in this push "
+				       "(mgit does not push LFS objects)", (char *)where.p);
+		}
 		buf_free(&b);
 		buf_free(&where);
 	}
@@ -574,8 +669,11 @@ int check_run(const struct objlist *objs, const struct check_ref *refs, size_t n
 		free(ck.path[i]);
 	free(ck.path);
 	free(ck.by_id);
-	for (i = 0; i < ck.nr; i++)
+	for (i = 0; i < ck.nr; i++) {
 		regfree(&ck.r[i].re);
+		if (ck.r[i].kind == R_SECRET || ck.r[i].kind == R_PRIVATE)
+			regfree(&ck.r[i].re_nl);
+	}
 	free(ck.r);
 	idset_free(&ck.trees_done);
 	idset_free(&ck.paths_done);

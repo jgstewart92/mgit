@@ -504,9 +504,12 @@ for v in ofs ref cloned multi; do
 	done
 	same "$v: all $n packed objects read as git reads them" 0 "$badn"
 	if [ "$n" -ge 60 ]; then ok; else bad "$v: only $n objects"; fi
-	in_git "$r" log --first-parent > "$tmp/want"
+	in_git "$r" log > "$tmp/want"
 	in_mg "$r" log > "$tmp/got"
-	same_files "$v: log matches git log --first-parent" "$tmp/want" "$tmp/got"
+	same_files "$v: log matches git log (every parent, newest first)" "$tmp/want" "$tmp/got"
+	in_git "$r" log --first-parent > "$tmp/want"
+	in_mg "$r" log --first-parent > "$tmp/got"
+	same_files "$v: log --first-parent matches git's" "$tmp/want" "$tmp/got"
 	short=$(in_git "$r" rev-parse --short=7 HEAD~4)
 	for rev in HEAD HEAD^2 v1 "$short"; do
 		same "$v: rev-parse $rev" "$(in_git "$r" rev-parse "$rev")" "$(in_mg "$r" rev-parse "$rev")"
@@ -1112,7 +1115,7 @@ st=$?
 same "push: the check refuses a secret" "1 refused" "$([ $st -ne 0 ] && echo 1) $(case $out in *"FAIL secret"*settings.ini:1*"nothing was sent"*) echo refused ;; esac)"
 same "push: nothing reached the far side" "$before" "$($GIT -C "$bare" for-each-ref)"
 case $(in_mg "$ps_" push https://host.example/x.git side 2>&1; echo " exit $?") in *"mgit pushes over ssh or to a path"*" exit 128") ok "push: an https url is refused" ;; *) bad "push to an https url was not refused as such" ;; esac
-case $(in_mg "$ps_" push github.com:someone/x.git side 2>&1; echo " exit $?") in *"test ssh: refusing host github.com"*" exit 128") ok "push: the harness refuses any host but the stand-in" ;; *) bad "the harness let a push through to another host" ;; esac
+case $(in_mg "$ps_" push github.com:someone/x.git main 2>&1; echo " exit $?") in *"test ssh: refusing host github.com"*" exit 128") ok "push: the harness refuses any host but the stand-in" ;; *) bad "the harness let a push through to another host" ;; esac
 in_mg "$ps_" remote add here "$tmp/plain.git"
 $GIT init -q --bare "$tmp/plain.git"
 in_mg "$ps_" push here main >/dev/null 2>&1 || bad "push to a remote whose url is a local path"
@@ -1291,7 +1294,8 @@ clone_cmp() {
 	same "clone $label: HEAD as git clone's" "$($GIT -C "$gref" symbolic-ref HEAD) $($GIT -C "$gref" rev-parse HEAD)" "$($GIT -C "$d" symbolic-ref HEAD) $($GIT -C "$d" rev-parse HEAD)"
 	same "clone $label: origin/HEAD as git clone's" "$($GIT -C "$gref" symbolic-ref refs/remotes/origin/HEAD)" "$($GIT -C "$d" symbolic-ref refs/remotes/origin/HEAD 2>&1)"
 	same "clone $label: the whole history as git clone's" "$($GIT -C "$gref" log --all --format='%H %P %T %s')" "$($GIT -C "$d" log --all --format='%H %P %T %s')"
-	same "clone $label: mgit log as git log --first-parent" "$(in_git "$gref" log --first-parent)" "$(in_mg "$d" log)"
+	same "clone $label: mgit log as git log" "$(in_git "$gref" log)" "$(in_mg "$d" log)"
+	same "clone $label: mgit log --first-parent as git's" "$(in_git "$gref" log --first-parent)" "$(in_mg "$d" log --first-parent)"
 	same "clone $label: files, modes and symlinks as git clone's" "$(listing "$gref")" "$(listing "$d")"
 	same "clone $label: the index as git clone's" "$($GIT -C "$gref" ls-files -s)" "$($GIT -C "$d" ls-files -s)"
 	same "clone $label: git status clean" "clean" "$(out=$($GIT -C "$d" status --porcelain) && [ -z "$out" ] && echo clean)"
@@ -1512,5 +1516,505 @@ out=$(cd "$tmp" && mg clone canned:x canned-ref 2>&1)
 st=$?
 same "clone: a pack of REF_DELTA entries is indexed and checked" "0 $($GIT -C "$cb" rev-parse main)" "$st $(in_git "$tmp/canned-ref" rev-parse HEAD)"
 quiet "clone: git fsck --strict on the REF_DELTA clone" $GIT -C "$tmp/canned-ref" fsck --strict --no-dangling
+
+# ---- 6.0.1 ----
+# 34. the GitHub system test's findings: checkout's notices and its remote-tracking branches, the check before ssh,
+# binary files, long runs of NULs, files over max-size, host names in context, deltas and side-band on push, and
+# check's warnings for what GitHub takes without its content (LFS pointers, submodule entries)
+v1=$tmp/v601 vsrc=$tmp/v601/src.git
+mkdir -p "$v1"
+cat > "$v1/rules.conf" <<'EOF'
+max-size 104857600
+branch ^(main|side|lfs|series)$
+tag ^v[0-9]+\.[0-9]+\.[0-9]+$
+secret \bAKIA[0-9A-Z]{16}\b
+private \b(hostA|hostB)\b
+private (?i)\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b
+allow (?i)@example\.(com|org|net)\b
+EOF
+cp "$v1/rules.conf" "$XDG_CONFIG_HOME/mgit/check.conf"
+$GIT init -q -b main "$v1/w"
+(
+	cd "$v1/w" || exit 1
+	at 1800900000
+	printf 'plain\n' > a.txt
+	$GIT add -A && $GIT commit -q -m Start
+	$GIT checkout -q -b lfs
+	printf 'version https://git-lfs.github.com/spec/v1\noid sha256:4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d17e2393\nsize 12345\n' > model.bin
+	printf '*.bin filter=lfs diff=lfs merge=lfs -text\n' > .gitattributes
+	$GIT add -A && $GIT update-index --add --cacheinfo "160000,$($GIT rev-parse HEAD),mod" && $GIT commit -q -m 'LFS and a submodule'
+	$GIT checkout -q -b side main
+	printf 'side\n' > side.txt
+	$GIT add -A && $GIT commit -q -m Side
+	$GIT checkout -q main
+) || bad "6.0.1 source fixture"
+$GIT clone -q --bare "$v1/w" "$vsrc" 2>/dev/null
+mg clone "standin:$vsrc" "$v1/c1" > /dev/null 2>&1 || bad "6.0.1 clone"
+# 1. checkout says what clone says about what it leaves as stored
+in_mg "$v1/c1" branch lfs origin/lfs > /dev/null 2>&1
+out=$(in_mg "$v1/c1" checkout lfs 2>&1)
+case $out in *"notice: 1 submodule not fetched"*": mod"*) ok "checkout: a notice names the submodule not fetched" ;; *) bad "checkout submodule notice: $out" ;; esac
+case $out in *"notice: 1 file is a Git LFS pointer, left as it is"*": model.bin"*) ok "checkout: a notice names the LFS pointer" ;; *) bad "checkout LFS notice: $out" ;; esac
+case $out in *"notice: .gitattributes asks for filter=lfs (.gitattributes:1)"*) ok "checkout: a notice names the filter not applied" ;; *) bad "checkout attributes notice: $out" ;; esac
+same "checkout: no notice where nothing new needs one" 0 "$(in_mg "$v1/c1" checkout main 2>&1 | grep -c 'notice:')"
+# 8. checkout of a branch that is only on the remote makes it, tracking the remote's, as git does
+$GIT clone -q "$vsrc" "$v1/g2" 2>/dev/null
+mg clone "standin:$vsrc" "$v1/c2" > /dev/null 2>&1
+out=$(in_mg "$v1/c2" checkout side 2>&1)
+st=$?
+same "checkout of a remote's branch: git's two lines, exit 0" "0 branch 'side' set up to track 'origin/side'. Switched to a new branch 'side'" "$st $(printf '%s\n' "$out" | tr '\n' ' ' | sed 's/ $//')"
+(cd "$v1/g2" && $GIT checkout -q side) 2>/dev/null
+same "checkout of a remote's branch: HEAD and the branch as git's" "$($GIT -C "$v1/g2" symbolic-ref HEAD) $($GIT -C "$v1/g2" rev-parse side)" "$($GIT -C "$v1/c2" symbolic-ref HEAD) $($GIT -C "$v1/c2" rev-parse side)"
+same "checkout of a remote's branch: its upstream as git sets it" "$($GIT -C "$v1/g2" config --get-regexp '^branch\.side\.')" "$($GIT -C "$v1/c2" config --get-regexp '^branch\.side\.')"
+same "checkout of a remote's branch: the files as git's" "$(listing "$v1/g2")" "$(listing "$v1/c2")"
+same "checkout of a remote's branch: git status clean" clean "$(out=$($GIT -C "$v1/c2" status --porcelain) && [ -z "$out" ] && echo clean)"
+in_mg "$v1/c2" checkout main > /dev/null 2>&1
+same "checkout of the branch made so: an ordinary switch the second time" "Switched to branch 'side'" "$(in_mg "$v1/c2" checkout side 2>&1)"
+fails "checkout: a name no branch, revision or remote's branch has is still refused" in_mg "$v1/c2" checkout nosuch
+in_mg "$v1/c2" remote add second "standin:$vsrc"
+in_mg "$v1/c2" fetch second > /dev/null 2>&1
+out=$(in_mg "$v1/c2" checkout lfs 2>&1)
+case "$? $out" in "128 "*"more than one remote (origin, second)"*) ok "checkout: a branch two remotes have is refused, naming both" ;; *) bad "checkout with two remotes: $out" ;; esac
+# 2. push: the check runs before ssh starts, so a refused push never connects
+mg init "$v1/p" > /dev/null
+printf 'clean\n' > "$v1/p/a.txt"
+in_mg "$v1/p" commit -q -m Start
+$GIT init -q --bare -b main "$v1/p.git"
+in_mg "$v1/p" remote add origin "standin:$v1/p.git"
+in_mg "$v1/p" push > /dev/null 2>&1 || bad "6.0.1 first push"
+printf 'key AKIA%s\n' ABCDEFGHIJKLMNOP > "$v1/p/creds.txt"
+in_mg "$v1/p" commit -q -m Creds
+lines=$(wc -l < "$fb/commands")
+out=$(in_mg "$v1/p" push 2>&1)
+same "push: refused by the check before ssh runs (the stand-in ssh never started)" "1 1 $lines" "$([ $? -ne 0 ] && echo 1) $(printf '%s\n' "$out" | grep -c 'FAIL secret') $(wc -l < "$fb/commands")"
+# 3. binary files get the size and name rules only; their bytes are not text
+rm -rf "$v1/k" && mg init "$v1/k" > /dev/null
+printf 'int x;\n' > "$v1/k/x.c"
+in_mg "$v1/k" commit -q -m Start
+printf 'ELF\000\001built on hostA, key AKIA%s\n' ABCDEFGHIJKLMNOP > "$v1/k/tool.bin"
+in_mg "$v1/k" commit -q -m Binary
+out=$(in_mg "$v1/k" check 2>&1)
+same "check: a binary file's bytes are not read as text (a NUL in its first 8000 bytes)" "0 0" "$? $(printf '%s\n' "$out" | grep -c '^FAIL')"
+printf 'built on hostA, key AKIA%s\n' ABCDEFGHIJKLMNOP > "$v1/k/tool.txt"
+in_mg "$v1/k" commit -q -m Text
+same "check: the same bytes as text still fail, both rules on the one line" "1 1" "$(in_mg "$v1/k" check > "$tmp/k.out" 2>&1; echo $?) $(grep -c '^FAIL secret:[0-9]*,private:[0-9]* *tool.txt:1:' "$tmp/k.out")"
+rm -rf "$v1/k2" && mg init "$v1/k2" > /dev/null
+printf 'a\000b' > "$v1/k2/hostA-image.bin"
+in_mg "$v1/k2" commit -q -m Name
+same "check: a binary file's name still goes through the private rules" "1 1" "$(in_mg "$v1/k2" check > "$tmp/k.out" 2>&1; echo $?) $(grep -c '^FAIL private:[0-9]* *hostA-image.bin:' "$tmp/k.out")"
+# 2. a file over max-size is refused for its size, and its text is not read
+rm -rf "$v1/k3" && mg init "$v1/k3" > /dev/null
+{ seq 1 2000; echo 'built on hostA'; } > "$v1/k3/big.txt"
+in_mg "$v1/k3" commit -q -m Big
+sed 's/^max-size .*/max-size 5000/' "$v1/rules.conf" > "$XDG_CONFIG_HOME/mgit/check.conf"
+in_mg "$v1/k3" check > "$tmp/k.out" 2>&1
+same "check: a file over max-size fails on its size alone, its text unread" "1 0" "$(grep -c '^FAIL size *big.txt:' "$tmp/k.out") $(grep -c '^FAIL private' "$tmp/k.out")"
+# 2. a long run of NULs in a text file costs no more than reading it, and what follows it is still checked
+{ cat "$here/check.conf"; printf 'private \\b(hostA|hostB)\\b\n'; } > "$XDG_CONFIG_HOME/mgit/check.conf"
+rm -rf "$v1/k4" && mg init "$v1/k4" > /dev/null
+{ seq 1 2000; head -c 40000000 /dev/zero; printf '\nbuilt on hostA\n'; } > "$v1/k4/log.txt"
+in_mg "$v1/k4" commit -q -m Log
+out=$(cd "$v1/k4" && timeout 10 "$MGIT" check 2>&1)
+same "check: 40 MB of NULs in a text file, then a host name, under the shipped rules: found, within 10 s" "1 1" "$? $(printf '%s\n' "$out" | grep -c '^FAIL private:[0-9]* *log.txt:2002:')"
+# 4. host names in context: a rule made of whole words passes a numbered series (b00 ... b30) and catches the name in
+# text. These rows test the rule as written in a settings file (no code changed for them): the plain \b form, the
+# negative control, fails on the series.
+rm -rf "$v1/k5" && mg init "$v1/k5" > /dev/null
+n=0
+while [ $n -le 30 ]; do mkdir -p "$v1/k5/files/b$(printf %02d $n)" && printf '%d\n' $n > "$v1/k5/files/b$(printf %02d $n)/f.txt"; n=$((n + 1)); done
+printf 'see files/b26/f.txt and run-b26.log\n' > "$v1/k5/notes.txt"
+in_mg "$v1/k5" commit -q -m Series
+printf 'branch ^main$\nprivate \\b(b26)\\b\n' > "$XDG_CONFIG_HOME/mgit/check.conf"
+same "check: the plain host rule \\b(b26)\\b trips on a numbered series (the control): the path, then the note" "1 2" "$(in_mg "$v1/k5" check > "$tmp/k.out" 2>&1; echo $?) $(grep -c '^FAIL private' "$tmp/k.out")"
+cat > "$XDG_CONFIG_HOME/mgit/check.conf" <<'EOF'
+branch ^main$
+private (^|[^[:alnum:]_./-])(b26)($|[^[:alnum:]_/-]|[.]($|[^[:alnum:]_]))
+private \b(b26)/(b26)\b
+EOF
+same "check: the host rule in context passes the numbered series" "0" "$(in_mg "$v1/k5" check > "$tmp/k.out" 2>&1; echo $?)"
+for line in 'built on b26' 'ssh b26 make' '(b26)' 'b26: done' "b26's disk" 'tested on b26.' 'mail jo@b26' 'b26/b26 both'; do
+	rm -rf "$v1/k6" && mg init "$v1/k6" > /dev/null
+	printf '%s\n' "$line" > "$v1/k6/notes.txt"
+	in_mg "$v1/k6" commit -q -m Note
+	same "check: the host rule in context catches: $line" "1 1" "$(in_mg "$v1/k6" check > "$tmp/k.out" 2>&1; echo $?) $(grep -c '^FAIL private[:,0-9a-z]* *notes.txt:1:' "$tmp/k.out")"
+done
+# 9. GitHub takes an LFS pointer with no LFS object and a submodule entry with no commits of its own: check warns
+cp "$v1/rules.conf" "$XDG_CONFIG_HOME/mgit/check.conf"
+out=$(in_mg "$v1/c1" check lfs 2>&1)
+same "check: an LFS pointer and a submodule entry are warnings, and the check passes" "0 1 1" "$? $(printf '%s\n' "$out" | grep -c '^WARN lfs *model.bin: a Git LFS pointer') $(printf '%s\n' "$out" | grep -c '^WARN submodule *mod: a submodule entry')"
+# 5. push sends deltas: on objects in the same pack, and on what the far side has (a thin pack, as git push sends)
+rm -rf "$v1/d" "$v1/d.git"
+mg init "$v1/d" > /dev/null
+$GIT init -q --bare -b main "$v1/d.git"
+$GIT -C "$v1/d.git" config receive.unpackLimit 1 # the far side keeps each pack (index-pack --fix-thin)
+seq 1 40000 > "$v1/d/data.txt"
+in_mg "$v1/d" commit -q -m Start
+in_mg "$v1/d" remote add origin "standin:$v1/d.git"
+in_mg "$v1/d" push origin main > /dev/null 2>&1 || bad "delta fixture first push"
+for k in 1 2 3 4 5 6; do
+	awk -v k=$k '$0 == k * 5000 { print "changed " k; next } { print }' "$v1/d/data.txt" > "$v1/d/data.new" && mv "$v1/d/data.new" "$v1/d/data.txt"
+	in_mg "$v1/d" commit -q -m "Change $k"
+done
+mkdir -p "$v1/cnt"
+cat > "$v1/cnt/ssh" <<'EOF'
+#!/bin/sh
+# the harness's ssh, keeping what it is sent in sent
+[ "$1" = -p ] && shift 2
+case $1 in standin) ;; *) echo "test ssh: refusing host $1" >&2; exit 255 ;; esac
+tee "${0%/*}/sent" | sh -c "$2"
+EOF
+chmod 755 "$v1/cnt/ssh"
+(cd "$v1/d" && PATH="$v1/cnt:$PATH" timeout 60 "$MGIT" push origin main) > "$tmp/d.out" 2>&1 || bad "delta push: $(cat "$tmp/d.out")"
+whole=$(git -C "$v1/d" rev-list --objects main~6..main | git -C "$v1/d" pack-objects -q --stdout --window=0 --depth=0 | wc -c)
+same "push: 6 versions of a 230 KB file sent in under 10 % of the bytes they take whole" yes "$([ "$(wc -c < "$v1/cnt/sent")" -lt $((whole / 10)) ] && echo yes)"
+newest=$(ls -t "$v1"/d.git/objects/pack/*.idx | head -n 1)
+same "push: the far side's pack holds the 6 versions as deltas" 6 "$($GIT verify-pack -v "$newest" | awk '$2 == "blob" && NF >= 7' | wc -l)"
+case $(cat "$tmp/d.out") in *"Total 18 (delta "*) ok "push: says how many objects and deltas it sent" ;; *) bad "push summary: $(cat "$tmp/d.out")" ;; esac
+same "push: no progress from the far side when stderr is no terminal (quiet), as git" 0 "$(grep -c 'Resolving deltas' "$tmp/d.out")"
+printf 'one more\n' >> "$v1/d/data.txt"
+in_mg "$v1/d" commit -q -m 'One more'
+(cd "$v1/d" && PATH="$v1/cnt:$PATH" timeout 60 "$MGIT" push origin main) > "$tmp/d.out" 2>&1 || bad "thin push: $(cat "$tmp/d.out")"
+newest=$(ls -t "$v1"/d.git/objects/pack/*.idx | head -n 1)
+same "push: one more version goes as a delta on the far side's copy (thin), under 2 KB in all" "1 yes" "$($GIT verify-pack -v "$newest" | awk '$2 == "blob" && NF >= 7' | wc -l) $([ "$(wc -c < "$v1/cnt/sent")" -lt 2048 ] && echo yes)"
+quiet "push: git fsck --strict on the far side after the delta pushes" $GIT -C "$v1/d.git" fsck --strict --no-dangling
+$GIT clone -q "$v1/d.git" "$v1/dback" 2>/dev/null
+same_files "push: git clone of the far side has the file as here" "$v1/d/data.txt" "$v1/dback/data.txt"
+mg clone "standin:$v1/d.git" "$v1/dm" > /dev/null 2>&1
+same_files "push: and so does mgit clone of it" "$v1/d/data.txt" "$v1/dm/data.txt"
+# 6. side-band on push: what the far side's hooks say comes back as remote: lines, and a hook's refusal is reported
+mkdir -p "$v1/d.git/hooks"
+printf '#!/bin/sh\necho "hook says hello" >&2\n' > "$v1/d.git/hooks/post-receive"
+chmod 755 "$v1/d.git/hooks/post-receive"
+printf 'again\n' >> "$v1/d/data.txt"
+in_mg "$v1/d" commit -q -m Again
+out=$(in_mg "$v1/d" push origin main 2>&1)
+same "push: a hook's message comes back as a remote: line (side-band-64k)" "0 1" "$? $(printf '%s\n' "$out" | grep -cx 'remote: hook says hello')"
+printf '#!/bin/sh\necho "no pushes today" >&2\nexit 1\n' > "$v1/d.git/hooks/pre-receive"
+chmod 755 "$v1/d.git/hooks/pre-receive"
+printf 'refused\n' >> "$v1/d/data.txt"
+in_mg "$v1/d" commit -q -m Refused
+before=$($GIT -C "$v1/d.git" rev-parse main)
+out=$(in_mg "$v1/d" push origin main 2>&1)
+same "push: a refusing hook: its remote: line, [remote rejected], exit 1, the branch unchanged" "1 1 1 $before" "$? $(printf '%s\n' "$out" | grep -cx 'remote: no pushes today') $(printf '%s\n' "$out" | grep -c '\[remote rejected\] main -> main (pre-receive hook declined)') $($GIT -C "$v1/d.git" rev-parse main)"
+rm -f "$v1/d.git/hooks/pre-receive" "$v1/d.git/hooks/post-receive"
+# 7. the portable SHA-1 rounds (machines without the x86 SHA instructions) give git's ids too
+if [ -n "${MGIT_PORTABLE:-}" ] || cc -std=c23 -O2 -ffp-contract=off -DMGIT_SHA1_PORTABLE -o "$tmp/mgit-portable" "$here"/src/*.c 2>/dev/null; then
+	pm=${MGIT_PORTABLE:-$tmp/mgit-portable}
+	for x in empty hello binary random70k seq; do
+		same "portable SHA-1: hash-object $x" "$($GIT hash-object "$f/$x")" "$("$pm" hash-object "$f/$x")"
+	done
+else
+	bad "the portable build did not compile"
+fi
+
+# 35. mgit 6.1.0: -C; log over every parent (--all, --first-parent, -<n>, --since and --until, --format, --stat, paths);
+# diff between two revisions; ls-files; config --get. Each against git, whose diffs are taken with --no-renames.
+h=$tmp/h610
+$GIT init -q -b main "$h"
+hc() { GIT_AUTHOR_DATE="$1 -0500" GIT_COMMITTER_DATE="$1 +0000" $GIT -C "$h" commit -q --allow-empty -m "$2"; }
+hadd() { $GIT -C "$h" add -A; }
+printf 'a1\n' > "$h/a"
+mkdir -p "$h/d"
+printf 'x\n' > "$h/d/x"
+printf '#!/bin/sh\n' > "$h/run.sh"
+printf 'file\n' > "$h/swap"
+hadd
+hc 1790000000 "$(printf 'root\n\nbody of root')"
+$GIT -C "$h" checkout -q -b side
+printf 's1\n' > "$h/s"
+hadd
+hc 1790000200 "$(printf 'side one\nsecond line of the subject  \n\nbody')"
+$GIT -C "$h" checkout -q main
+printf 'a2\n' >> "$h/a"
+hadd
+hc 1790000100 main1
+$GIT -C "$h" tag -a -m 'annotated' v1
+hc 1790000300 empty
+GIT_AUTHOR_DATE='1790000400 +0100' GIT_COMMITTER_DATE='1790000400 +0000' $GIT -C "$h" merge -q --no-ff -m 'merge side' side
+rm "$h/d/x" "$h/swap"
+ln -s a "$h/swap"
+printf 'b\000in\n' > "$h/bin"
+chmod 755 "$h/run.sh"
+printf 'a3\n' >> "$h/a"
+hadd
+hc 1790000500 "$(printf '\n  main2 with\ttab  \n')"
+$GIT -C "$h" checkout -q -b later v1
+printf 'l\n' > "$h/l"
+hadd
+hc 1790000600 later
+$GIT -C "$h" checkout -q main
+$GIT -C "$h" update-ref refs/tags/treeref "$($GIT -C "$h" rev-parse 'HEAD^{tree}')"
+$GIT -C "$h" update-ref refs/remotes/origin/main "$($GIT -C "$h" rev-parse side)"
+$GIT -C "$h" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+$GIT -C "$h" pack-refs --all
+$GIT -C "$h" branch loose later
+same "-C: rev-parse HEAD in another directory" "$($GIT -C "$h" rev-parse HEAD)" "$(mg -C "$h" rev-parse HEAD)"
+same "-C twice, the second relative to the first, and an empty one" "$($GIT -C "$tmp" -C h610 -C '' rev-parse HEAD)" "$(mg -C "$tmp" -C h610 -C '' rev-parse HEAD)"
+lg() { # NAME ARGS...: git log and mgit log with the same arguments, compared whole
+	name=$1; shift
+	in_git "$h" log "$@" > "$tmp/want"
+	in_mg "$h" log "$@" > "$tmp/got"
+	same_files "log $name" "$tmp/want" "$tmp/got"
+}
+lg "over every parent, newest first"
+lg "--first-parent" --first-parent
+lg "--all (branches, an annotated tag, a ref to a tree, a symbolic remote ref, packed and loose)" --all
+lg "--all --format with every placeholder, %% and one it does not know" --all --format='%H %h|%an|%ad|%s|%%|%q|%n.'
+lg "--format=tformat:" --format='tformat:%h %s'
+lg "two revisions" --format=%s later side
+lg "-2" -2
+lg "-n 3 --format" -n 3 --format=%s
+lg "--max-count=1 --all" --max-count=1 --all --format=%H
+lg "--stat over every parent (a root, a merge, an empty commit, a binary file, a mode change, a file turned symlink)" --stat --no-renames
+lg "--stat --format" --stat --no-renames --format='%h %ad %s'
+lg "-- a file" --format=%s -- a
+lg "-- a file only the side branch changed (the merge is simplified away)" --format=%s -- s
+lg "-- a directory, then deleted" --format=%s -- d
+lg "-- two paths, --stat" --stat --no-renames --format=%s -- a bin
+same "-- a path no commit touches: exit 0, no output" "rc=0 []" "$(out=$(in_mg "$h" log -- nothing-here); echo "rc=$? [$out]")"
+lg "--all -- path" --all --format=%s -- l
+lg "--since with --stat and paths, the walk cut at the first older commit on each line" --since=@1790000150 --stat --no-renames --format='%h %ad %s' -- a s bin
+lg "--until over a merge" --until=@1790000350 --format=%s
+lg "--since and --until together, --all" --all --since=@1790000150 --until=@1790000450 --format=%s
+(cd "$h/d" 2>/dev/null) || mkdir -p "$h/d"
+(cd "$h/d" && $GIT log --format=%s -- ../a) > "$tmp/want"
+(cd "$h/d" && mg log --format=%s -- ../a) > "$tmp/got"
+same_files "log -- ../a from a subdirectory" "$tmp/want" "$tmp/got"
+in_mg "$bigp" log --format=%h > "$tmp/got"
+same "log %h over 2^14 packed objects: 8 digits, as git's" "$(in_git "$bigp" log --format=%h)" "$(cat "$tmp/got")"
+# --since and --until: for each form, git's own reading of it (rev-parse --since) is T; commits at T+1, T and T-1 (or
+# 120 s either side for forms that move with the clock) must split the same way under both tools
+dates() {
+	for spec in '@1790000000' '1790000000' '2026-11-12 03:50' '2026-11-12 3:50:07' '2026-11-12T03:50:10' \
+		'2026-11-12 03:50 +0000' '2026-11-12 03:50:00 -0530' '2026-11-12 03:50Z' '2026-11-12T03:50:00Z' \
+		'2026-07-04 12:00' '2026-11-01 01:30' '2026-03-08 02:30'; do
+		printf 'fixed|%s\n' "$spec"
+	done
+	for spec in '26 hours ago' '10 minutes ago' '30 seconds ago' '3 days ago' '2 weeks ago' '1 week ago' '1.hour.ago' \
+		'now' 'yesterday' '2026-07-04' '2026-01-15'; do
+		printf 'moving|%s\n' "$spec"
+	done
+}
+dn=0
+dates > "$tmp/dates"
+while IFS='|' read -r kind spec; do
+	dn=$((dn + 1))
+	r=$tmp/dates$dn
+	$GIT init -q -b main "$r"
+	t=$($GIT -C "$r" rev-parse --since="$spec" | sed 's/^--max-age=//')
+	if [ "$kind" = fixed ]; then set -- $((t - 1)) $t $((t + 1)); else set -- $((t - 120)) $((t + 120)); fi
+	for ts in "$@"; do
+		GIT_AUTHOR_DATE="$ts +0000" GIT_COMMITTER_DATE="$ts +0000" $GIT -C "$r" commit -q --allow-empty -m "at $ts"
+	done
+	same "log --since='$spec' (git reads $t)" "$(in_git "$r" log --since="$spec" --format=%s)" "$(in_mg "$r" log --since="$spec" --format=%s)"
+	same "log --until='$spec'" "$(in_git "$r" log --until="$spec" --format=%s)" "$(in_mg "$r" log --until="$spec" --format=%s)"
+done < "$tmp/dates"
+same "the date rows ran" 23 "$dn"
+r=$tmp/dates1
+same "log --after and --before are --since and --until" "$(in_git "$r" log --after=@1790000000 --before=@1790000000 --format=%s)" "$(in_mg "$r" log --after=@1790000000 --before=@1790000000 --format=%s)"
+same "log -1 --until=DATE --format=%h: the newest commit before a time (for HEAD@{...})" "$(in_git "$r" log -1 --until=@1790000000 --format=%h)" "$(in_mg "$r" log -1 --until=@1790000000 --format=%h)"
+out=$(in_mg "$r" log --since=garbage 2>&1)
+same "log --since=garbage is refused with the date named, where git would read it as now" "128 1" "$? $(printf '%s\n' "$out" | grep -c "cannot read the date 'garbage'")"
+# diff between two revisions, against git diff --no-renames
+dr() { # NAME ARGS...
+	name=$1; shift
+	in_git "$h" diff --no-renames "$@" > "$tmp/want"
+	in_mg "$h" diff "$@" > "$tmp/got"
+	same_files "diff $name" "$tmp/want" "$tmp/got"
+}
+dr "REV REV: a patch over additions, a deletion, a binary file, a mode change and a file turned symlink" main~1 main
+dr "REV REV over a merge's second parent" side main
+dr "REV REV --stat" main~3 main --stat
+dr "--stat REV REV" --stat "$($GIT -C "$h" rev-list --max-parents=0 HEAD)" later
+dr "--name-only REV REV" --name-only v1 main
+dr "a tag and a branch" v1 later
+dr "REV REV -- a path" main~3 main -- a
+dr "REV REV --stat -- a directory and a file" main~4 main --stat -- d swap
+dr "a tree's id against a commit" "$($GIT -C "$h" rev-parse 'v1^{tree}')" main
+dr "newer to older (reversed)" main main~3
+same "diff --quiet REV REV: exit 1 when they differ" 1 "$(in_mg "$h" diff --quiet main~1 main; echo $?)"
+same "diff --quiet REV REV: exit 0 for the same tree (an empty commit and its parent)" "0 0" "$(in_mg "$h" diff --quiet main~2 main~3; echo $?) $(in_git "$h" diff --quiet main~2 main~3; echo $?)"
+same "diff REV REV of the same tree prints nothing" "rc=0 []" "$(out=$(in_mg "$h" diff main~2 main~3); echo "rc=$? [$out]")"
+in_git "$g" diff --no-renames "$($GIT -C "$g" rev-list --max-parents=0 HEAD | tail -n 1)" HEAD > "$tmp/want"
+in_mg "$g" diff "$($GIT -C "$g" rev-list --max-parents=0 HEAD | tail -n 1)" HEAD > "$tmp/got"
+same_files "diff root HEAD over the fixture's whole history (quoted names, symlinks, binaries)" "$tmp/want" "$tmp/got"
+printf 'f changed\n' > "$bigp/f"
+$GIT -C "$bigp" add f
+$GIT -C "$bigp" commit -q -m 'big two'
+dr2() { in_git "$bigp" diff --no-renames "$@" > "$tmp/want"; in_mg "$bigp" diff "$@" > "$tmp/got"; }
+dr2 HEAD~1 HEAD
+same_files "diff REV REV over 2^14 packed objects: the index line abbreviates to 8, as git's" "$tmp/want" "$tmp/got"
+printf 'f changed again\n' > "$bigp/f"
+in_git "$bigp" diff HEAD > "$tmp/want"
+in_mg "$bigp" diff > "$tmp/got"
+same_files "diff (HEAD to the working tree) over 2^14 packed objects: 8 digits too" "$tmp/want" "$tmp/got"
+out=$(in_mg "$h" diff main 2>&1)
+same "diff with one revision is refused (two, or none)" "128 1" "$? $(printf '%s\n' "$out" | grep -c 'takes two revisions')"
+# git's own diff, not only a minimal one (xdiff: dropped lines, cost cutoffs, sliding and the indent heuristic): code-like
+# files of 40 to 4000 lines edited at random, each pair committed and diffed by both tools
+xd=$tmp/xdiff
+$GIT init -q -b main "$xd"
+codegen() { # SEED LINES
+	awk -v s="$1" -v n="$2" 'BEGIN { srand(s); for (i = 0; i < n; i++) { r = rand()
+		if (r < 0.15) print ""; else if (r < 0.25) print "}"; else if (r < 0.33) print "\t}"
+		else if (r < 0.48) printf "\tx%d = %d;\n", int(rand() * 50), int(rand() * 9)
+		else if (r < 0.56) printf "int f%d(void)\n{\n", int(rand() * 40)
+		else printf "\t\tcall(%d);\n", int(rand() * 30) } }'
+}
+codeedit() { # SEED RATE < old > new
+	awk -v s="$1" -v p="$2" 'BEGIN { srand(s) } { r = rand()
+		if (r < p) next
+		if (r < 2 * p) { printf "\tx%d = %d;\n", int(rand() * 50), int(rand() * 9); next }
+		print
+		if (r > 1 - p) { if (rand() < 0.5) print ""; else printf "\t\tcall(%d);\n", int(rand() * 30) } }'
+}
+xbad=0 xn=0 xmin=0 xind=0
+for spec in 1,40,0.1 2,40,0.3 3,200,0.05 4,200,0.2 5,200,0.4 6,1500,0.02 7,1500,0.1 8,1500,0.3 9,4000,0.05 10,4000,0.15 \
+	11,4000,0.3 12,600,0.1 13,600,0.25 14,90,0.15 15,90,0.35 16,3000,0.2 17,2500,0.12 18,800,0.08 19,120,0.5 20,5000,0.25; do
+	seed=${spec%%,*} rate=${spec##*,} lines=${spec#*,}
+	lines=${lines%%,*}
+	codegen "$seed" "$lines" > "$xd/code.c"
+	$GIT -C "$xd" add -A && $GIT -C "$xd" commit -q -m "base $seed"
+	codeedit $((seed + 1000)) "$rate" < "$xd/code.c" > "$xd/code.c.new"
+	mv "$xd/code.c.new" "$xd/code.c"
+	$GIT -C "$xd" add -A && $GIT -C "$xd" commit -q --allow-empty -m "edit $seed"
+	xn=$((xn + 1))
+	in_git "$xd" diff --no-renames HEAD~1 HEAD > "$tmp/want"
+	in_mg "$xd" diff HEAD~1 HEAD > "$tmp/got"
+	cmp -s "$tmp/want" "$tmp/got" || { xbad=$((xbad + 1)); [ -n "${MGIT_TEST_ROWS:-}" ] && echo "xdiff case $spec differs"; }
+	in_git "$xd" diff --no-renames --stat HEAD~1 HEAD > "$tmp/want"
+	in_mg "$xd" diff --stat HEAD~1 HEAD > "$tmp/got"
+	cmp -s "$tmp/want" "$tmp/got" || xbad=$((xbad + 1))
+	in_git "$xd" diff --no-renames HEAD~1 HEAD > "$tmp/want"
+	in_git "$xd" diff --no-renames --minimal HEAD~1 HEAD | cmp -s - "$tmp/want" || xmin=$((xmin + 1))
+	in_git "$xd" diff --no-renames --no-indent-heuristic HEAD~1 HEAD | cmp -s - "$tmp/want" || xind=$((xind + 1))
+done
+same "diff REV REV as git's own, patch and --stat, over $xn generated code edits" "0 of $xn" "$xbad of $xn"
+[ "$xmin" -gt 0 ] && ok "some of those git diffs are not minimal ($xmin of $xn), so its cost cutoffs were exercised" ||
+	bad "no case reached git's cost cutoffs, so the row above does not test them"
+[ "$xind" -gt 0 ] && ok "the indent heuristic moved hunks in $xind of $xn, so it was exercised" ||
+	bad "the indent heuristic moved nothing, so the row above does not test it"
+in_git "$xd" log --stat --no-renames > "$tmp/want"
+in_mg "$xd" log --stat > "$tmp/got"
+same_files "log --stat over those edits, as git's" "$tmp/want" "$tmp/got"
+# ls-files: the index's paths, quoted as git quotes them, or NUL-ended with -z; below the current directory
+for repo in "$m" "$g" "$h"; do
+	same "ls-files in ${repo##*/}" "$(in_git "$repo" ls-files)" "$(in_mg "$repo" ls-files)"
+	in_git "$repo" ls-files -z > "$tmp/want"
+	in_mg "$repo" ls-files -z > "$tmp/got"
+	same_files "ls-files -z in ${repo##*/}" "$tmp/want" "$tmp/got"
+done
+sub=$(in_git "$m" ls-files | grep -v '^"' | grep / | head -n 1 | cut -d/ -f1)
+same "ls-files from a subdirectory ($sub)" "$(cd "$m/$sub" && $GIT ls-files)" "$(cd "$m/$sub" && mg ls-files)"
+same "ls-files names quoted (a tab, a quote, a backslash, UTF-8)" "$(in_git "$m" ls-files | grep -c '^"')" "$(in_mg "$m" ls-files | grep -c '^"')"
+mg init "$tmp/noindex" > /dev/null
+same "ls-files with no index: nothing, exit 0" "rc=0 []" "$(out=$(in_mg "$tmp/noindex" ls-files); echo "rc=$? [$out]")"
+# config --get: the nearest file that sets it, the last value in it; subsections keep their case
+ch=$tmp/cfghome
+mkdir -p "$ch/.config/git" "$tmp/cfgrepo"
+printf '[user]\n\tname = Global Name\n\temail = global@example.com\n[core]\n\teditor = "vim -x"  ; a comment\n[remote "origin"]\n\turl = https://example.com/a.git\n[Section "Sub.Dots"]\n\tKey = "a \\"quoted\\" value with \\\\ and \\t" # trailing\n[multi]\n\tv = one\n\tv = two\n' > "$ch/.gitconfig"
+printf '[user]\n\tname = XDG Name\n[xdg]\n\tonly = yes\n' > "$ch/.config/git/config"
+$GIT init -q -b main "$tmp/cfgrepo"
+printf '[user]\n\temail = local@example.com\n' >> "$tmp/cfgrepo/.git/config"
+cg() { (cd "$1" && shift && env -u GIT_CONFIG_GLOBAL HOME="$ch" XDG_CONFIG_HOME="$ch/.config" $GIT config "$@"; echo "rc=$?"); }
+cm() { (cd "$1" && shift && env -u GIT_CONFIG_GLOBAL HOME="$ch" XDG_CONFIG_HOME="$ch/.config" timeout 60 "$MGIT" config "$@" 2>/dev/null; echo "rc=$?"); }
+for args in '--get user.email' '--global --get user.email' '--local --get user.email' '--get user.name' \
+	'--get USER.NAME' '--get xdg.only' '--get core.editor' '--get remote.origin.url' '--get section.Sub.Dots.key' \
+	'--get multi.v' '--get nope.nope' '--get section.sub.dots.key' '--local --get user.name'; do
+	same "config $args (in a repository)" "$(cg "$tmp/cfgrepo" $args)" "$(cm "$tmp/cfgrepo" $args)"
+done
+for args in '--get user.email' '--global --get user.email' '--get xdg.only' '--get nope.nope'; do
+	same "config $args (outside any repository)" "$(cg "$ch" $args)" "$(cm "$ch" $args)"
+done
+same "config --local outside a repository is refused" "rc=128" "$(cm "$ch" --local --get user.email)"
+same "config --get with no section is refused" "rc=128" "$(cm "$ch" --get user)"
+
+# 36. mgit 6.1.1: what fuzzing apply_delta found. F2: a delta's stated result size is checked against what its
+# instructions can give (at most 0xFFFFFF bytes each, a copy's three size bytes) before anything is allocated; F1: a
+# result of 0 bytes leaves its buffer NUL-terminated. The first rows are a pack whose delta copies 0x40000 bytes in one
+# 3-byte instruction, which git's own encoder never writes (it caps a copy at 0x10000) but git's reader takes: a bound
+# of 0x10000 per instruction refuses it. Built byte by byte (stored zlib blocks, so no compressor is needed), indexed
+# by git, then read back by mgit.
+hexb() { printf %s "$1" | sed 's/../\\x&/g' | { read -r s; printf "$s"; }; }   # hex string to bytes
+be32() { printf '%08x' "$1"; }
+adler() { od -An -v -tu1 "$1" | tr -s ' ' '\n' | awk 'BEGIN { a = 1 } NF { a = (a + $1) % 65521; b = (b + a) % 65521 } END { printf "%04x%04x", b, a }'; }
+zstore() {	# zlib stream of file $1 as stored blocks of at most 65535 bytes, to stdout
+	n=$(stat -c %s "$1"); off=0; printf '\x78\x01'
+	while :; do
+		l=$((n - off)); [ $l -gt 65535 ] && l=65535; last=0; [ $((off + l)) -eq $n ] && last=1
+		hexb "$(printf '%02x%02x%02x%02x%02x' $last $((l & 255)) $((l >> 8)) $((~l & 255)) $((~l >> 8 & 255)))"
+		tail -c +$((off + 1)) "$1" | head -c $l
+		off=$((off + l)); [ $last = 1 ] && break
+	done
+	hexb "$(adler "$1")"
+}
+bigcopy_pack() {	# $1: the .pack to write. Base: "x" and 0x40000 zero bytes; the delta's one copy takes all but the "x".
+	d=$(dirname "$1")
+	{ printf x; head -c 262144 /dev/zero; } > "$d/base.raw"
+	head -c 262144 /dev/zero > "$d/want.raw"
+	hexb 818010808010c10104 > "$d/delta.raw"	# src 0x40001, dst 0x40000, copy off 1 size 0x040000 (one offset byte, the third size byte)
+	{
+		printf 'PACK'; hexb "$(be32 2)$(be32 2)"
+		hexb b1808001; zstore "$d/base.raw"		# blob, size 0x40001
+		e1=$(( 4 + $(zstore "$d/base.raw" | wc -c) ))	# entry 1's length: the OFS_DELTA distance
+		hexb 69						# OFS_DELTA, delta size 9
+		n=$e1; s=$(printf '%02x' $((n & 127))); while n=$((n >> 7)); [ $n -gt 0 ]; do n=$((n - 1)); s=$(printf '%02x' $((128 | (n & 127))))$s; done
+		hexb "$s"; zstore "$d/delta.raw"
+	} > "$1.body"
+	{ cat "$1.body"; hexb "$(sha1sum "$1.body" | cut -c1-40)"; } > "$1"
+	rm -f "$1.body"
+}
+r=$tmp/bigcopy
+$GIT init -q "$r"
+bigcopy_pack "$r/x.pack"
+if (cd "$r" && $GIT index-pack -o .git/objects/pack/pack-x.idx x.pack >/dev/null && mv x.pack .git/objects/pack/pack-x.pack); then ok "git takes a delta with one 0x40000-byte copy"; else bad "git refuses the 0x40000-byte copy pack"; fi
+id=$(cd "$r" && $GIT hash-object want.raw)
+same "git reads the 0x40000-byte copy" "262144 $(sha1sum < "$r/want.raw")" "$(cd "$r" && $GIT cat-file blob $id > got.git; printf '%s %s' "$(stat -c %s got.git)" "$(sha1sum < got.git)")"
+same "mgit reads the 0x40000-byte copy" "262144 $(sha1sum < "$r/want.raw")" "$(cd "$r" && timeout 60 "$MGIT" cat-file -p $id > got.mg; printf '%s %s' "$(stat -c %s got.mg)" "$(sha1sum < got.mg)")"
+# F2 itself: a 9-byte delta (source 1 byte, no instructions) that claims 2^49 bytes is refused as a pack that does not
+# rebuild, not met with "out of memory", and the clone leaves nothing
+hb=$tmp/hugedst
+mkdir -p "$hb"
+printf x > "$hb/base.raw"
+hexb 018080808080808001 > "$hb/delta.raw"	# src 1, dst 2^49 (eight varint bytes)
+{
+	printf 'PACK'; hexb "$(be32 2)$(be32 2)"
+	hexb 31; zstore "$hb/base.raw"			# blob, size 1
+	hexb 69						# OFS_DELTA, delta size 9
+	hexb "$(printf '%02x' $((1 + $(zstore "$hb/base.raw" | wc -c))))"	# back to entry 1 (under 128 bytes: one byte)
+	zstore "$hb/delta.raw"
+} > "$hb/body"
+{ cat "$hb/body"; hexb "$(sha1sum "$hb/body" | cut -c1-40)"; } > "$hb/huge.pack"
+canned "$hb/huge.pack"
+refused "a delta that claims 2^49 bytes" "1 deltas have no base in it that rebuilds"
+# F1: apply_delta is static, so this row builds a small driver around this tree's pack.c (the rest of the tree linked
+# beside it); a reused buffer still holds its old bytes, so an unterminated 0-byte result would read as "stale"
+cat > "$tmp/f1.c" <<'EOF'
+#include "pack.c"
+
+int main(void)
+{
+	static const unsigned char d[] = { 0, 0 };	/* source 0 bytes, result 0 bytes, no instructions */
+	buf base = { 0 }, delta = { 0 }, out = { 0 };
+
+	buf_add(&delta, d, sizeof d);
+	buf_adds(&out, "stale");
+	if (apply_delta(&base, &delta, &out))
+		return 2;
+	printf("%zu %d\n", out.len, out.p[0]);
+	return 0;
+}
+EOF
+set --
+for s in "$here"/src/*.c; do
+	case $s in */pack.c | */main.c) ;; *) set -- "$@" "$s" ;; esac
+done
+if cc -std=c23 -O2 -ffp-contract=off -c -Dmain=mgit_main -o "$tmp/f1-main.o" "$here/src/main.c" 2>/dev/null &&
+	cc -std=c23 -O2 -ffp-contract=off -I"$here/src" -o "$tmp/f1" "$tmp/f1.c" "$tmp/f1-main.o" "$@" 2>/dev/null; then
+	out=$("$tmp/f1")
+	same "apply_delta: a result of 0 bytes leaves its buffer NUL-terminated" "0 0 0" "$out $?"
+else
+	bad "the apply_delta driver did not compile"
+fi
 printf 'pass %d  fail %d\n' "$pass" "$fail"
 exit $((fail > 0))

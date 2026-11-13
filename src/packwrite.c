@@ -11,23 +11,36 @@
 
 /* Writing packs: pack v2 with every object whole (no deltas, which git reads as any other pack), and its idx v2. */
 
+/* zlib's CRC-32, eight bytes a step through eight tables ("slicing by 8"), the bytes taken little-endian. */
 uint32_t crc32_update(uint32_t crc, const void *d, size_t n)
 {
-	static uint32_t table[256];
+	static uint32_t t[8][256];
 	const unsigned char *p = d;
 
-	if (!table[1]) {
+	if (!t[0][1]) {
 		uint32_t i, k, c;
 
 		for (i = 0; i < 256; i++) {
 			for (c = i, k = 0; k < 8; k++)
 				c = c & 1 ? 0xedb88320u ^ (c >> 1) : c >> 1;
-			table[i] = c;
+			t[0][i] = c;
 		}
+		for (i = 0; i < 256; i++)
+			for (k = 1; k < 8; k++)
+				t[k][i] = t[0][t[k - 1][i] & 0xff] ^ (t[k - 1][i] >> 8);
 	}
 	crc = ~crc;
+	while (n >= 8) {
+		uint32_t lo = crc ^ ((uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24);
+		uint32_t hi = (uint32_t)p[4] | (uint32_t)p[5] << 8 | (uint32_t)p[6] << 16 | (uint32_t)p[7] << 24;
+
+		crc = t[7][lo & 0xff] ^ t[6][(lo >> 8) & 0xff] ^ t[5][(lo >> 16) & 0xff] ^ t[4][lo >> 24] ^
+		      t[3][hi & 0xff] ^ t[2][(hi >> 8) & 0xff] ^ t[1][(hi >> 16) & 0xff] ^ t[0][hi >> 24];
+		p += 8;
+		n -= 8;
+	}
 	while (n--)
-		crc = table[(crc ^ *p++) & 0xff] ^ (crc >> 8);
+		crc = t[0][(crc ^ *p++) & 0xff] ^ (crc >> 8);
 	return ~crc;
 }
 

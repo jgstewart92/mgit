@@ -15,7 +15,8 @@
 
 char *git_dir, *work_tree;
 
-void repo_find(void)
+/* Finds the repository holding the current directory: 0, or -1 when there is none up to /. */
+int repo_try_find(void)
 {
 	char cwd[PATH_MAX], *slash;
 	struct stat st;
@@ -31,16 +32,22 @@ void repo_find(void)
 		if (found) {
 			git_dir = g;
 			work_tree = xstrdup(cwd);
-			return;
+			return 0;
 		}
 		if (lstat(g, &st) == 0 && !S_ISDIR(st.st_mode))
 			die("%s is a file; linked worktrees and submodules are not supported", g);
 		free(g);
 		if (!strcmp(cwd, "/"))
-			die("not a git repository (or any parent up to /)");
+			return -1;
 		slash = strrchr(cwd, '/');
 		slash[slash == cwd] = 0;
 	}
+}
+
+void repo_find(void)
+{
+	if (repo_try_find())
+		die("not a git repository (or any parent up to /)");
 }
 
 /*
@@ -169,8 +176,11 @@ static void config_paths(char *paths[3])
 	paths[2] = xdg && *xdg ? path_join(xdg, "git/config") : home ? path_join(home, ".config/git/config") : NULL;
 }
 
-/* section.sub.key (sub NULL for none) from the first file that sets it, the last value there winning. */
-char *config_get_sub(const char *section, const char *sub, const char *key)
+/*
+ * section.sub.key (sub NULL for none) from the first file that sets it, the last value there winning, over the files
+ * the mask names: 1 the repository's, 2 the home directory's .gitconfig, 4 $XDG_CONFIG_HOME/git/config.
+ */
+char *config_get_in(const char *section, const char *sub, const char *key, int files)
 {
 	struct config_query q = { section, sub, key, NULL };
 	char *paths[3];
@@ -178,11 +188,16 @@ char *config_get_sub(const char *section, const char *sub, const char *key)
 
 	config_paths(paths);
 	for (i = 0; i < 3; i++) {
-		if (!q.res && paths[i])
+		if (!q.res && paths[i] && files & (1 << i))
 			config_parse(paths[i], config_match, &q);
 		free(paths[i]);
 	}
 	return q.res;
+}
+
+char *config_get_sub(const char *section, const char *sub, const char *key)
+{
+	return config_get_in(section, sub, key, 7);
 }
 
 char *config_get(const char *section, const char *key)

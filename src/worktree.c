@@ -338,6 +338,12 @@ static int dir_expendable(const struct repo_state *s, const char *rel, const str
 	return ok;
 }
 
+/*
+ * The directory make_parents made or found last (a full path), so a run of files in one directory makes it once;
+ * forgotten whenever a directory is removed.
+ */
+static buf made;
+
 static void prune_parents(const char *path)
 {
 	char *p = xstrdup(path), *slash;
@@ -352,6 +358,7 @@ static void prune_parents(const char *path)
 		free(full);
 		if (r)
 			break;
+		made.len = 0;
 	}
 	free(p);
 }
@@ -376,20 +383,32 @@ static void remove_empty_dirs(const char *rel)
 		closedir(d);
 	if (rmdir(dir) && errno != ENOENT)
 		die("cannot remove directory %s: %s", dir, strerror(errno));
+	made.len = 0;
 	free(dir);
 }
 
 static void make_parents(const char *path)
 {
-	char *full = path_join(work_tree, path), *p;
+	char *full = path_join(work_tree, path), *p, *last = strrchr(full, '/');
+	size_t dl = (size_t)(last - full);
 	struct stat st;
 
+	if (made.len == dl && !memcmp(made.p, full, dl)) {
+		free(full);
+		return;
+	}
 	for (p = full + strlen(work_tree) + 1; (p = strchr(p, '/')); p++) {
 		*p = 0;
+		if (made.len > (size_t)(p - full) && made.p[p - full] == '/' && !memcmp(made.p, full, (size_t)(p - full))) {
+			*p = '/';
+			continue;	/* a parent of the directory made last */
+		}
 		if (mkdir(full, 0777) && (errno != EEXIST || lstat(full, &st) || !S_ISDIR(st.st_mode)))
 			die("cannot create directory %s", full);
 		*p = '/';
 	}
+	made.len = 0;
+	buf_add(&made, full, dl);
 	free(full);
 }
 
@@ -401,8 +420,11 @@ static mode_t current_umask(void)
 	return m;
 }
 
-/* Replaces whatever is at t->path atomically with the blob, and records the stat of what it wrote. */
-static void checkout_file(struct file *t)
+/*
+ * Replaces whatever is at t->path atomically with the blob, and records the stat of what it wrote. Where nothing
+ * stands (absent) the file is written in place, as git does, with no temporary name to rename.
+ */
+static void checkout_file(struct file *t, int absent)
 {
 	char *full = path_join(work_tree, t->path), *tmp;
 	struct stat st;
@@ -420,6 +442,15 @@ static void checkout_file(struct file *t)
 	if (type != OBJ_BLOB)
 		die("%s: expected a blob", t->path);
 	make_parents(t->path);
+	if (absent && t->mode == 0120000 && !symlink((char *)b.p, full))
+		goto written;
+	if (absent && t->mode != 0120000 &&
+	    (fd = open(full, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, t->mode == 0100755 ? 0777 : 0666)) >= 0) {
+		write_all(fd, b.p, b.len, full);
+		if (close(fd))
+			die("cannot write %s: %s", full, strerror(errno));
+		goto written;
+	}
 	tmp = xmalloc(strlen(full) + 16);
 	strcpy(tmp, full);
 	strcpy(strrchr(tmp, '/') + 1, ".mgit-XXXXXX");
@@ -438,11 +469,12 @@ static void checkout_file(struct file *t)
 	}
 	if (rename(tmp, full))
 		die("cannot rename %s to %s: %s", tmp, full, strerror(errno));
+	free(tmp);
+written:
 	if (lstat(full, &st))
 		die("cannot stat %s: %s", full, strerror(errno));
 	stat_data_from(&t->sd, &st);
 	t->have_stat = 1;
-	free(tmp);
 	free(full);
 	buf_free(&b);
 }
@@ -524,7 +556,7 @@ void worktree_switch(const struct files *from, struct files *to, const struct re
 
 			if (state[k] == W_DIR)
 				remove_empty_dirs(t->path);
-			checkout_file(t);
+			checkout_file(t, state[k] == W_ABSENT);
 		}
 	}
 
@@ -548,12 +580,49 @@ void worktree_switch(const struct files *from, struct files *to, const struct re
 	buf_free(&bad);
 }
 
+/*
+ * As git's checkout does for a branch that is not here: the one remote whose remote-tracking branch has that name
+ * (refs/remotes/<remote>/<name>, through the remote's fetch lines). Returns the remote's name, or NULL for none;
+ * dies when more than one remote has it.
+ */
+static char *tracking_remote(const char *name, char **track)
+{
+	char **remotes, *found = NULL, *ref;
+	size_t n, i;
+	buf b = { 0 }, all = { 0 };
+	unsigned char id[20];
+	int count = 0;
+
+	buf_printf(&b, "refs/heads/%s", name);
+	remotes = config_subsections("remote", &n);
+	for (i = 0; i < n; i++) {
+		ref = fetch_track(remotes[i], (char *)b.p);
+		if (ref && !ref_read(ref, id)) {
+			buf_printf(&all, "%s%s", count ? ", " : "", remotes[i]);
+			if (!count++) {
+				found = xstrdup(remotes[i]);
+				*track = ref;
+				ref = NULL;
+			}
+		}
+		free(ref);
+		free(remotes[i]);
+	}
+	free(remotes);
+	if (count > 1)
+		die("'%s' is a remote-tracking branch of more than one remote (%s): make it with mgit branch %s <remote>/%s",
+		    name, (char *)all.p, name, name);
+	buf_free(&b);
+	buf_free(&all);
+	return found;
+}
+
 int cmd_checkout(int argc, char **argv)
 {
 	struct repo_state s;
 	struct files to = { 0 };
 	unsigned char id[20], tree[20];
-	char hex[41];
+	char hex[41], *remote = NULL, *track = NULL;
 	buf ref = { 0 };
 	int branch;
 
@@ -563,14 +632,37 @@ int cmd_checkout(int argc, char **argv)
 	state_load(&s);
 	buf_printf(&ref, "refs/heads/%s", argv[1]);
 	branch = argv[1][0] != '-' && refname_ok((char *)ref.p) && !ref_read((char *)ref.p, id);
-	if (!branch && rev_parse(argv[1], id))
-		die("not a branch or revision: %s", argv[1]);
+	if (!branch && rev_parse(argv[1], id)) {
+		if (argv[1][0] == '-' || !refname_ok((char *)ref.p) || !(remote = tracking_remote(argv[1], &track)) ||
+		    ref_read(track, id))
+			die("not a branch or revision: %s", argv[1]);
+		branch = 1;
+	}
 	peel_to_commit(id);
 	commit_tree_id(id, tree);
 	tree_flatten(tree, &to);
 	worktree_switch(&s.head_files, &to, &s);
+	checkout_notices(&s.head_files, &to);
 	id_to_hex(id, hex);
-	if (branch) {
+	if (remote) {
+		buf cfg = { 0 };
+		const char *shown = !strncmp(track, "refs/remotes/", 13) ? track + 13 : track;
+
+		ref_update((char *)ref.p, id, NULL);
+		buf_adds(&cfg, "[branch \"");
+		buf_adds(&cfg, argv[1]);
+		buf_adds(&cfg, "\"]\n\tremote = ");
+		config_value(&cfg, remote);
+		buf_adds(&cfg, "\n\tmerge = ");
+		config_value(&cfg, (char *)ref.p);
+		buf_adds(&cfg, "\n");
+		config_append((char *)cfg.p);
+		head_set_symref((char *)ref.p);
+		printf("branch '%s' set up to track '%s'.\nSwitched to a new branch '%s'\n", argv[1], shown, argv[1]);
+		buf_free(&cfg);
+		free(remote);
+		free(track);
+	} else if (branch) {
 		head_set_symref((char *)ref.p);
 		printf("Switched to branch '%s'\n", argv[1]);
 	} else {

@@ -1,7 +1,7 @@
 #ifndef MGIT_H
 #define MGIT_H
 
-#define MGIT_VERSION "6.0.0"
+#define MGIT_VERSION "6.1.1"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -20,8 +20,8 @@ struct commit {
 	unsigned char tree[20];
 	unsigned char (*parent)[20];
 	int nparent;
-	const char *author, *msg;
-	size_t author_len, msg_len;
+	const char *author, *committer, *msg;
+	size_t author_len, committer_len, msg_len;
 };
 
 /* The stat fields git keeps in its index, truncated to 32 bits as git does. */
@@ -107,6 +107,7 @@ int zlib_inflate_prefix(buf *out, const unsigned char *in, size_t n, size_t *use
 struct objlist;
 int pack_verify(const char *idx_path, const struct objlist *want);
 void pack_index(const char *tmp, struct objlist *out);
+void pack_unmap_all(void);
 int pack_read(const unsigned char id[20], int *type, buf *out);
 int pack_has(const unsigned char id[20]);
 unsigned long pack_object_count(void);
@@ -124,10 +125,13 @@ int object_by_prefix(const char *hex, size_t n, unsigned char id[20]);
 
 /* main.c */
 char *repo_init(const char *dir);
+int abbrev_len(const unsigned char id[20], int len);
 
 /* repo.c */
 extern char *git_dir, *work_tree;
 void repo_find(void);
+int repo_try_find(void);
+char *config_get_in(const char *section, const char *sub, const char *key, int files);
 char *config_get(const char *section, const char *key);
 char *config_get_sub(const char *section, const char *sub, const char *key);
 char **config_subsections(const char *section, size_t *count);
@@ -193,11 +197,15 @@ void commit_tree_id(const unsigned char commit[20], unsigned char tree[20]);
 void ident(buf *out, const char *label, const char *role, const char *force);
 void cleanup_message(buf *out, const char *in, size_t n, int comments);
 int cmd_commit(int argc, char **argv);
-int cmd_log(int argc, char **argv);
 
 /* diff.c */
 int cmd_status(int argc, char **argv);
 int cmd_diff(int argc, char **argv);
+size_t diff_files_show(const struct files *a, const struct files *b, int mode, const char *lead);
+
+/* log.c */
+int parse_date(const char *s, long long *out);
+int cmd_log(int argc, char **argv);
 
 /* sync.c: between local repositories, and pull */
 char *other_repo(const char *dir, int *bare);
@@ -229,6 +237,10 @@ int descends(const unsigned char tip[20], const unsigned char anc[20]);
 uint32_t crc32_update(uint32_t crc, const void *d, size_t n);
 void idx_build(buf *out, const struct objlist *objs, const uint64_t *offs, const uint32_t *crcs, const unsigned char sum[20]);
 void pack_send(int fd, const char *what, const struct objlist *objs, uint64_t *offs, uint32_t *crcs, unsigned char sum[20]);
+
+/* delta.c: the pack push sends, with deltas */
+void pack_send_thin(int fd, const char *what, const struct objlist *objs, const unsigned char (*edges)[20], size_t nedges,
+		    int ofs);
 int cmd_gc(int argc, char **argv);
 
 /* tag.c */
@@ -272,6 +284,7 @@ void child_finish(pid_t pid, int fd, const char *what);
 int fetch_remote(const char *remote);
 char *fetch_track(const char *remote, const char *ref);
 void checkout_notices(const struct files *from, const struct files *to);
+int is_lfs_pointer(const buf *b);
 int cmd_clone(int argc, char **argv);
 int cmd_fetch(int argc, char **argv);
 

@@ -13,16 +13,21 @@
 
 static const char usage_text[] =
 	"mgit " MGIT_VERSION ", a git subset in git's own format\n"
-	"usage: mgit <command> [<args>]\n"
+	"usage: mgit [-C <dir>] <command> [<args>]\n"
 	"\n"
 	"  init [<dir>]                       create an empty repository (branch main)\n"
 	"  status                             changes since HEAD (what commit would record)\n"
-	"  diff [--quiet | --name-only | --stat] [-- <path>...]\n"
-	"                                     those changes as a patch, names, a diffstat, or exit 1 if any\n"
+	"  diff [--quiet | --name-only | --stat] [<rev> <rev>] [-- <path>...]\n"
+	"                                     those changes, or one revision's to another's, as a patch, names,\n"
+	"                                     a diffstat, or exit 1 if any\n"
 	"  commit -m <msg> [-m <msg>...] [--author 'Name <email>'] [-q] [-- <path>...]\n"
 	"                                     snapshot every file not ignored, plus tracked files; with paths,\n"
 	"                                     only those (deletions in them included), the rest as in HEAD\n"
-	"  log [<rev>]                        first-parent history\n"
+	"  log [--all] [--first-parent] [-<n>] [--since=<date>] [--until=<date>] [--format=<fmt>] [--stat]\n"
+	"      [<rev>...] [-- <path>...]      history, newest first (%H %h %an %ad %s %n in <fmt>)\n"
+	"  ls-files [-z]                      the files the index tracks\n"
+	"  config [--global | --local] --get <name>\n"
+	"                                     one setting from the files mgit reads (exit 1 if unset)\n"
 	"  branch [<name> [<start>]]          list or create branches\n"
 	"  checkout (<branch> | <commit>)     switch, keeping local changes the switch does not touch\n"
 	"  tag [-a] [-m <msg>...] <name> [<rev>]\n"
@@ -257,7 +262,7 @@ static int cmd_branch(int argc, char **argv)
  * git's abbreviation: at least len digits (len < 0: 7, or more once the packs hold 2^14 objects or more, from the
  * same count git uses), extended until no other object shares the prefix.
  */
-static int abbrev_len(const unsigned char id[20], int len)
+int abbrev_len(const unsigned char id[20], int len)
 {
 	unsigned char other[20];
 	char hex[41];
@@ -316,6 +321,97 @@ static int cmd_rev_parse(int argc, char **argv)
 	return 0;
 }
 
+/* The index's paths in its order, relative to the current directory and only below it, as git ls-files lists them. */
+static int cmd_ls_files(int argc, char **argv)
+{
+	struct files idx = { 0 };
+	uint32_t stamp[2];
+	char cwd[PATH_MAX];
+	const char *here;
+	size_t i, wl, hl;
+	int z = 0, k;
+	buf out = { 0 };
+
+	for (k = 1; k < argc; k++) {
+		if (strcmp(argv[k], "-z"))
+			die("usage: mgit ls-files [-z]");
+		z = 1;
+	}
+	repo_find();
+	if (index_read(&idx, stamp))
+		return 0;
+	if (!getcwd(cwd, sizeof cwd))
+		die("cannot get current directory: %s", strerror(errno));
+	wl = strcmp(work_tree, "/") ? strlen(work_tree) : 0;
+	here = cwd[wl] == '/' ? cwd + wl + 1 : "";
+	hl = strlen(here);
+	for (i = 0; i < idx.n; i++) {
+		const char *p = idx.v[i].path;
+
+		if (hl) {
+			if (strncmp(p, here, hl) || p[hl] != '/')
+				continue;
+			p += hl + 1;
+		}
+		if (z) {
+			buf_adds(&out, p);
+			buf_addc(&out, 0);
+		} else {
+			buf_quote(&out, "", p);
+			buf_addc(&out, '\n');
+		}
+		fwrite(out.p, 1, out.len, stdout);
+		out.len = 0;
+	}
+	buf_free(&out);
+	files_free(&idx);
+	return 0;
+}
+
+/*
+ * git config --get <section>[.<subsection>].<key>, read only: from the repository's config, the home directory's .gitconfig and
+ * $XDG_CONFIG_HOME/git/config (--global: the last two; --local: the first), the nearest file that sets it winning and
+ * its last value there. No system file and no includes, as everywhere else mgit reads config.
+ */
+static int cmd_config(int argc, char **argv)
+{
+	const char *name = NULL, *dot, *last;
+	char *section, *sub = NULL, *v;
+	int i, files = 7, get = 0, rc;
+
+	for (i = 1; i < argc; i++) {
+		if (!strcmp(argv[i], "--global"))
+			files = 6;
+		else if (!strcmp(argv[i], "--local"))
+			files = 1;
+		else if (!strcmp(argv[i], "--get"))
+			get = 1;
+		else if (argv[i][0] != '-' && !name)
+			name = argv[i];
+		else
+			die("usage: mgit config [--global | --local] --get <name>");
+	}
+	if (!get || !name)
+		die("usage: mgit config [--global | --local] --get <name>");
+	dot = strchr(name, '.');
+	last = strrchr(name, '.');
+	if (!dot || dot == name || !last[1])
+		die("key does not contain a section and a name: %s", name);
+	if (repo_try_find() && files == 1)
+		die("--local can only be used inside a git repository");
+	section = xstrndup(name, (size_t)(dot - name));
+	if (last != dot)
+		sub = xstrndup(dot + 1, (size_t)(last - dot - 1));
+	v = config_get_in(section, sub, last + 1, files);
+	rc = v ? 0 : 1;
+	if (v)
+		puts(v);
+	free(section);
+	free(sub);
+	free(v);
+	return rc;
+}
+
 int main(int argc, char **argv)
 {
 	static const struct {
@@ -341,9 +437,18 @@ int main(int argc, char **argv)
 		{ "write-tree", cmd_write_tree },
 		{ "hash-object", cmd_hash_object },
 		{ "cat-file", cmd_cat_file },
+		{ "ls-files", cmd_ls_files },
+		{ "config", cmd_config },
 	};
 	size_t i;
 
+	/* git's -C: run as if started in <dir> (each relative to the one before; an empty one changes nothing) */
+	while (argc >= 3 && !strcmp(argv[1], "-C")) {
+		if (*argv[2] && chdir(argv[2]))
+			die("cannot change to '%s': %s", argv[2], strerror(errno));
+		argv += 2;
+		argc -= 2;
+	}
 	if (argc < 2)
 		return usage();
 	if (argc == 2 && !strcmp(argv[1], "--version")) {

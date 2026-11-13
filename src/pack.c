@@ -223,10 +223,12 @@ static int apply_delta(const buf *base, const buf *delta, buf *out)
 	const unsigned char *p = delta->p, *end = delta->p + delta->len;
 	uint64_t src = delta_size(&p, end), dst = delta_size(&p, end);
 
-	if (src != base->len || dst == UINT64_MAX || dst > SIZE_MAX - 1)
+	/* each instruction is at least one byte and gives at most 0xFFFFFF (a copy's three size bytes), so a larger dst cannot be met: refuse it before allocating */
+	if (src != base->len || dst == UINT64_MAX || dst > SIZE_MAX - 1 || dst / 0xFFFFFF > (uint64_t)(end - p))
 		return -1;
 	out->len = 0;
 	buf_grow(out, (size_t)dst);
+	out->p[0] = 0;	/* NUL-terminated even when nothing is added (dst 0) */
 	while (p < end) {
 		unsigned char c = *p++;
 
@@ -530,6 +532,47 @@ int pack_verify(const char *idx_path, const struct objlist *want)
 	return 0;
 }
 
+/*
+ * For a pack pack_index has just checked object by object: the idx read back as a reader will use it, its own
+ * SHA-1, the pack's SHA-1 in it, the count, and each object found through it at the offset it was found at. The
+ * objects are not rebuilt and hashed a second time.
+ */
+static int idx_readback(const char *idx_path, const struct objlist *want, const uint64_t *offs)
+{
+	struct repo_packs r = { 0 };
+	const char *slash = strrchr(idx_path, '/');
+	char *dir = xstrndup(idx_path, (size_t)(slash - idx_path));
+	const struct pack *p;
+	size_t i;
+	int bad = 0;
+
+	load_pack(&r, dir, slash + 1);
+	free(dir);
+	if (r.n != 1) {
+		warning("%s: its pack is missing", idx_path);
+		return -1;
+	}
+	p = &r.v[0];
+	if (!sum_ok(p->idx, p->idx_len - 20, p->idx + p->idx_len - 20) ||
+	    memcmp(p->idx + p->idx_len - 40, p->data + p->data_len - 20, 20) || p->n != want->n) {
+		warning("%s: its checksum, its pack's or its count is wrong", idx_path);
+		bad = 1;
+	}
+	for (i = 0; i < want->n && !bad; i++) {
+		uint64_t off;
+
+		if (!find(p, want->v[i].id, &off) || off != offs[i]) {
+			warning("%s: an object is not where the pack has it", idx_path);
+			bad = 1;
+		}
+	}
+	munmap((void *)p->idx, p->idx_len);
+	munmap((void *)p->data, p->data_len);
+	free(p->name);
+	free(r.v);
+	return bad ? -1 : 0;
+}
+
 static void cache_forget(const struct pack *p)
 {
 	size_t s;
@@ -539,8 +582,40 @@ static void cache_forget(const struct pack *p)
 			cache[s].p = NULL;
 }
 
+static const struct pack *indexing;	/* the pack pack_index has mapped, until it returns */
+
+/*
+ * Unmaps every pack this process has mapped, each repository's and one being indexed. On NFS a file removed while it
+ * is still mapped stays behind as .nfsXXXX, and so does the directory holding it, so whatever removes pack files that
+ * may be mapped (a refused pack, a clone that failed) calls this first.
+ */
+void pack_unmap_all(void)
+{
+	size_t i, k;
+
+	for (i = 0; i < nrepos; i++) {
+		for (k = 0; k < repos[i].n; k++) {
+			munmap((void *)repos[i].v[k].idx, repos[i].v[k].idx_len);
+			munmap((void *)repos[i].v[k].data, repos[i].v[k].data_len);
+			free(repos[i].v[k].name);
+		}
+		free(repos[i].v);
+		free(repos[i].dir);
+	}
+	free(repos);
+	repos = NULL;
+	nrepos = 0;
+	if (indexing)
+		munmap((void *)indexing->data, indexing->data_len);
+	indexing = NULL;
+	ix.p = NULL;
+	for (i = 0; i < CACHE_SLOTS; i++)
+		cache[i].p = NULL;
+}
+
 [[noreturn]] static void index_fail(const char *pack, const char *idx, const char *why)
 {
+	pack_unmap_all();
 	unlink(pack);
 	if (idx)
 		unlink(idx);
@@ -572,6 +647,7 @@ void pack_index(const char *tmp, struct objlist *out)
 	if (stat(tmp, &st) || st.st_size < 32)
 		index_fail(tmp, NULL, "it is not a pack");
 	p.data = map_file(tmp, &p.data_len);
+	indexing = &p;
 	if (p.data_len < 32 || memcmp(p.data, "PACK", 4) || (get32(p.data + 4) != 2 && get32(p.data + 4) != 3))
 		index_fail(tmp, NULL, "it is not a pack");
 	if (!sum_ok(p.data, p.data_len - 20, p.data + p.data_len - 20))
@@ -681,10 +757,8 @@ void pack_index(const char *tmp, struct objlist *out)
 		snprintf(why, sizeof why, "%u deltas have no base in it that rebuilds", left);
 		index_fail(tmp, NULL, why);
 	}
-	if (!n) {
-		unlink(tmp);
-		goto out;
-	}
+	if (!n)
+		goto out;	/* an empty pack: nothing to keep, removed below once unmapped */
 
 	offs = xmalloc(n * sizeof *offs);
 	crcs = xmalloc(n * sizeof *crcs);
@@ -711,7 +785,7 @@ void pack_index(const char *tmp, struct objlist *out)
 		buf_adds(&name, ".pack");
 		index_fail((char *)name.p, tidx, "the idx could not be renamed");
 	}
-	/* listed for this repository first: pack_verify finds a REF_DELTA's base through it */
+	/* listed for this repository first, as every later read finds the pack through it */
 	{
 		buf pk = { 0 }, in = { 0 };
 
@@ -723,7 +797,7 @@ void pack_index(const char *tmp, struct objlist *out)
 			buf_printf(&in, "pack-%s.idx", hex);
 			load_pack(r, dir, (char *)in.p);
 		}
-		if (pack_verify((char *)name.p, out))
+		if (idx_readback((char *)name.p, out, offs))
 			index_fail((char *)pk.p, (char *)name.p, "it does not read back through its idx");
 		buf_free(&pk);
 		buf_free(&in);
@@ -732,7 +806,10 @@ void pack_index(const char *tmp, struct objlist *out)
 	free(crcs);
 	free(tidx);
 out:
+	indexing = NULL;
 	munmap((void *)p.data, p.data_len);
+	if (!n)
+		unlink(tmp);
 	free(p.name);
 	free(v);
 	free(dir);

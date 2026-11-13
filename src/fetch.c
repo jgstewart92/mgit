@@ -34,11 +34,17 @@ struct source {
 };
 
 static char *tmp_pack;		/* a pack being received, removed at exit unless pack_index took it */
+static int tmp_fd = -1;		/* open while it is being written */
 
 static void tmp_cleanup(void)
 {
-	if (tmp_pack)
+	if (tmp_fd >= 0)
+		close(tmp_fd);
+	tmp_fd = -1;
+	if (tmp_pack) {
+		pack_unmap_all();	/* first: on NFS a removed file still open or mapped stays as .nfsXXXX */
 		unlink(tmp_pack);
+	}
 }
 
 static void local_open(struct source *s)
@@ -353,14 +359,22 @@ static char *tmp_pack_open(int *fd)
 	tmp_pack = path_join(dir, "tmp_pack_XXXXXX");
 	if ((*fd = mkstemp(tmp_pack)) < 0)
 		die("cannot create %s: %s", tmp_pack, strerror(errno));
+	tmp_fd = *fd;
 	free(dir);
 	return tmp_pack;
 }
 
 static void tmp_pack_done(int fd, struct objlist *fresh)
 {
-	if (fsync(fd) || close(fd))
-		die("cannot write %s: %s", tmp_pack, strerror(errno));
+	int bad = fsync(fd) != 0, e = errno;
+
+	if (close(fd) && !bad) {
+		bad = 1;
+		e = errno;
+	}
+	tmp_fd = -1;
+	if (bad)
+		die("cannot write %s: %s", tmp_pack, strerror(e));
 	pack_index(tmp_pack, fresh);
 	free(tmp_pack);
 	tmp_pack = NULL;
@@ -852,7 +866,7 @@ int cmd_fetch(int argc, char **argv)
 
 /* ---- notices: what a checkout leaves as git (set up as usual) would not ---- */
 
-static int is_lfs_pointer(const buf *b)
+int is_lfs_pointer(const buf *b)
 {
 	static const char sig[] = "version https://git-lfs.github.com/spec/v1\n";
 
@@ -1007,8 +1021,10 @@ static void remove_tree(const char *path, int keep_top)
 
 static void clone_cleanup(void)
 {
-	if (clone_dir && !clone_done)
+	if (clone_dir && !clone_done) {
+		pack_unmap_all();	/* first: on NFS a removed pack still mapped stays as .nfsXXXX, and its directories with it */
 		remove_tree(clone_dir, !clone_made);
+	}
 }
 
 /* git's guess: the last part of the url, without a trailing /.git or .git. */

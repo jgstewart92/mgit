@@ -10,10 +10,12 @@
 #include <unistd.h>
 
 /*
- * push over ssh, as git does it: ssh HOST git-receive-pack 'PATH'; read the refs the far side advertises (pkt-lines);
- * run the pre-push check on what would go; send the updates and one pack of the objects the far side lacks; read
- * its report-status. Fast-forwards and new refs only; an existing tag is never moved. A local path still goes
- * through push_local, as before.
+ * push over ssh, as git does it: the pre-push check first, on what would go by the remote-tracking refs, before
+ * anything connects; then ssh HOST git-receive-pack 'PATH'; read the refs the far side advertises (pkt-lines); check
+ * again only what the far side turns out to lack beyond that; send the updates and one pack of the objects the far
+ * side lacks, with deltas (on objects in the pack and on what the far side has); read its report-status, over
+ * side-band-64k when it offers that, with its messages shown as "remote: " lines. Fast-forwards and new refs only; an
+ * existing tag is never moved. A local path still goes through push_local, as before.
  */
 
 static const unsigned char zero_id[20];
@@ -103,21 +105,117 @@ static void show_sent(const struct update *u, int tag)
 
 static const char push_usage[] = "usage: mgit push [--dry-run] [<remote> [<refspec>...]]";
 
+/* What a side-band packet on band 2 says, as git shows it: each line (ended by LF or CR) after "remote: ". */
+static void remote_says(const unsigned char *p, size_t n, int *at_start)
+{
+	size_t i;
+
+	for (i = 0; i < n; i++) {
+		if (*at_start) {
+			fputs("remote: ", stderr);
+			*at_start = 0;
+		}
+		fputc(p[i], stderr);
+		if (p[i] == '\n' || p[i] == '\r')
+			*at_start = 1;
+	}
+}
+
+/*
+ * The far side's answer after the pack: over side-band, the report-status pkt-lines arrive inside band 1 (gathered
+ * into rs), band 2 is shown, band 3 is an error; without it the report comes straight.
+ */
+static void read_report(int from, buf *rs)
+{
+	buf b = { 0 };
+	int at_start = 1;
+
+	while (pkt_read_raw(from, &b)) {
+		if (!b.len)
+			continue;
+		if (b.p[0] == 1) {
+			buf_add(rs, b.p + 1, b.len - 1);
+		} else if (b.p[0] == 2) {
+			remote_says(b.p + 1, b.len - 1, &at_start);
+		} else if (b.p[0] == 3) {
+			fflush(stdout);
+			die("the remote reported an error: %.*s", (int)(b.len - 1 - (b.p[b.len - 1] == '\n')), (char *)b.p + 1);
+		} else {
+			die("bad side-band packet from the remote (band %d)", b.p[0]);
+		}
+	}
+	if (!at_start)
+		fputc('\n', stderr);
+	buf_free(&b);
+}
+
+/* One pkt-line from rs at *at into line (its newline dropped); 0 for a flush or the end. */
+static int rs_line(const buf *rs, size_t *at, buf *line)
+{
+	char h[5], *e;
+	unsigned long n;
+
+	line->len = 0;
+	if (rs->len - *at < 4)
+		return 0;
+	memcpy(h, rs->p + *at, 4);
+	h[4] = 0;
+	n = strtoul(h, &e, 16);
+	if (*e || !is_hex(h, 4) || (n && n < 4) || (n && n - 4 > rs->len - *at - 4))
+		die("bad pkt-line length in the remote's report: '%s'", h);
+	*at += 4;
+	if (!n)
+		return 0;
+	buf_add(line, rs->p + *at, n - 4);
+	*at += n - 4;
+	if (line->len && line->p[line->len - 1] == '\n')
+		line->p[--line->len] = 0;
+	return 1;
+}
+
+/* The refs the remote-tracking refs say a named remote has: refs/remotes/NAME/X as refs/heads/X. */
+static size_t tracked_tips(const char *remote, unsigned char (**tips)[20])
+{
+	char **names;
+	size_t n, i, k = 0;
+	buf b = { 0 };
+
+	if (!remote) {
+		*tips = xmalloc(sizeof **tips);
+		return 0;
+	}
+	buf_printf(&b, "refs/remotes/%s/", remote);
+	names = ref_list((char *)b.p, &n);
+	*tips = xmalloc((n + 1) * sizeof **tips);
+	for (i = 0; i < n; i++) {
+		buf name = { 0 };
+
+		buf_printf(&name, "%s%s", (char *)b.p, names[i]);
+		if (!ref_read((char *)name.p, (*tips)[k]))
+			k++;
+		buf_free(&name);
+		free(names[i]);
+	}
+	free(names);
+	buf_free(&b);
+	return k;
+}
+
 int cmd_push(int argc, char **argv)
 {
 	struct update *ups;
 	struct advert adv;
 	struct target t;
-	struct objlist objs = { 0 };
-	struct idset seen = { 0 };
-	struct check_ref *refs;
-	unsigned char (*tips)[20];
+	struct objlist objs = { 0 }, pre_objs = { 0 };
+	struct idset seen = { 0 }, pre_seen = { 0 }, pre_ids = { 0 }, sent = { 0 };
+	struct check_ref *refs, *pre_refs;
+	unsigned char (*tips)[20], (*tracked)[20], (*edges)[20];
 	const char *remote = NULL, *caps;
 	char *url;
 	char **specs = NULL;
-	size_t nspecs = 0, nups, nsend = 0, i, ntips = 0;
-	int dry = 0, to, from, rejected = 0, failed = 0, first = 1, status;
-	buf line = { 0 }, out = { 0 };
+	size_t nspecs = 0, nups, nsend = 0, i, ntips = 0, ntracked, npre = 0, nedges = 0, at = 0;
+	int dry = 0, to, from, rejected = 0, failed = 0, first = 1, status, band = 0, covered;
+	buf line = { 0 }, out = { 0 }, rs = { 0 };
 	pid_t pid;
 
 	for (i = 1; i < (size_t)argc; i++) {
@@ -160,6 +258,32 @@ int cmd_push(int argc, char **argv)
 			if (!strcmp(ups[k].dst, ups[i].dst))
 				die("%s is named twice", ups[i].dst);
 	}
+
+	/*
+	 * The check, before ssh starts: what the push sends if the far side has what the remote-tracking refs say (the
+	 * refs whose tracking ref is at the new commit already are taken as up to date and not checked).
+	 */
+	ntracked = tracked_tips(remote, &tracked);
+	walk((const unsigned char (*)[20])tracked, ntracked, &pre_seen, NULL, 1);
+	tips = xmalloc((nups + 1) * sizeof *tips);
+	pre_refs = xmalloc((nups + 1) * sizeof *pre_refs);
+	for (i = 0; i < nups; i++) {
+		char *tr = remote && !strncmp(ups[i].dst, "refs/heads/", 11) ? fetch_track(remote, ups[i].dst) : NULL;
+		unsigned char cur[20];
+
+		if (!(tr && !ref_read(tr, cur) && !memcmp(cur, ups[i].new, 20))) {
+			pre_refs[npre].name = ups[i].dst;
+			memcpy(pre_refs[npre].id, ups[i].new, 20);
+			memcpy(tips[npre++], ups[i].new, 20);
+		}
+		free(tr);
+	}
+	walk((const unsigned char (*)[20])tips, npre, &pre_seen, &pre_objs, 0);
+	for (i = 0; i < pre_objs.n; i++)
+		idset_add(&pre_ids, pre_objs.v[i].id);
+	if (npre && check_run(&pre_objs, pre_refs, npre, "push"))
+		die("push refused by the check: nothing was sent (nothing connected)");
+	free(tips);
 
 	signal(SIGPIPE, SIG_IGN);
 	pid = ssh_start(&t, "git-receive-pack", &to, &from);
@@ -207,7 +331,20 @@ int cmd_push(int argc, char **argv)
 	walk((const unsigned char (*)[20])tips, ntips, &seen, &objs, 0);
 
 	printf("To %s\n", url);
-	if (nsend && check_run(&objs, refs, ntips, "push")) {
+	/* checked already unless the far side lacks more than the remote-tracking refs said, or a ref was taken as up to date */
+	covered = 1;
+	for (i = 0; i < objs.n && covered; i++)
+		covered = idset_has(&pre_ids, objs.v[i].id);
+	for (i = 0; i < ntips && covered; i++) {
+		size_t k;
+
+		for (k = 0; k < npre && strcmp(pre_refs[k].name, refs[i].name); k++)
+			;
+		covered = k < npre && !memcmp(pre_refs[k].id, refs[i].id, 20);
+	}
+	if (nsend && !covered)
+		puts("push: the remote lacks more than its remote-tracking refs here say; checking that too");
+	if (nsend && !covered && check_run(&objs, refs, ntips, "push")) {
 		buf_adds(&out, "0000");
 		write_all(to, out.p, out.len, "the remote");
 		close(to);
@@ -249,8 +386,12 @@ int cmd_push(int argc, char **argv)
 		id_to_hex(u->new, b);
 		buf_printf(&cmd, "%s %s %s", a, b, u->dst);
 		if (first) {
+			band = has_cap(caps, "report-status") && has_cap(caps, "side-band-64k");
 			buf_addc(&cmd, 0);
 			buf_adds(&cmd, has_cap(caps, "report-status") ? "report-status " : "");
+			buf_adds(&cmd, band ? "side-band-64k " : "");
+			/* as git: no progress from the far side unless stderr is a terminal (its hooks are still heard) */
+			buf_adds(&cmd, band && !isatty(2) && has_cap(caps, "quiet") ? "quiet " : "");
 			buf_adds(&cmd, "agent=mgit/" MGIT_VERSION);
 		}
 		buf_addc(&cmd, '\n');
@@ -260,21 +401,52 @@ int cmd_push(int argc, char **argv)
 	}
 	buf_adds(&out, "0000");
 	write_all(to, out.p, out.len, "the remote");
-	{
-		unsigned char sum[20];
+	/* deltas on what the far side has: the parents of the commits sent that it holds, and the old tips of the refs */
+	edges = xmalloc((objs.n + nups + 1) * sizeof *edges);
+	for (i = 0; i < objs.n; i++)
+		idset_add(&sent, objs.v[i].id);
+	for (i = 0; i < nups; i++)
+		if (!ups[i].status && ups[i].have_old && object_exists(ups[i].old))
+			memcpy(edges[nedges++], ups[i].old, 20);
+	for (i = 0; i < objs.n; i++) {
+		struct commit c;
+		buf b = { 0 };
+		int type, k;
 
-		pack_send(to, "the remote", &objs, NULL, NULL, sum);
+		if (objs.v[i].type != OBJ_COMMIT)
+			continue;
+		object_read_or_die(objs.v[i].id, &type, &b);
+		commit_parse(&b, &c);
+		for (k = 0; k < c.nparent; k++)
+			if (!idset_has(&sent, c.parent[k]) && object_exists(c.parent[k])) {
+				size_t e;
+
+				for (e = 0; e < nedges && memcmp(edges[e], c.parent[k], 20); e++)
+					;
+				if (e == nedges)
+					memcpy(edges[nedges++], c.parent[k], 20);
+			}
+		free(c.parent);
+		buf_free(&b);
 	}
+	pack_send_thin(to, "the remote", &objs, (const unsigned char (*)[20])edges, nedges, has_cap(caps, "ofs-delta"));
 	close(to);
+	free(edges);
+	idset_free(&sent);
 
 	if (has_cap(caps, "report-status")) {
-		if (!pkt_read(from, &line) || strncmp((char *)line.p, "unpack ", 7))
+		if (band) {
+			read_report(from, &rs);
+			if (!rs_line(&rs, &at, &line) || strncmp((char *)line.p, "unpack ", 7))
+				die("the remote sent no unpack status");
+		} else if (!pkt_read(from, &line) || strncmp((char *)line.p, "unpack ", 7)) {
 			die("the remote sent no unpack status");
+		}
 		if (strcmp((char *)line.p, "unpack ok")) {
 			warning("the remote could not unpack the pack: %s", (char *)line.p + 7);
 			failed = 1;
 		}
-		while (pkt_read(from, &line)) {
+		while (band ? rs_line(&rs, &at, &line) : pkt_read(from, &line)) {
 			int ok = !strncmp((char *)line.p, "ok ", 3);
 			char *name = (char *)line.p + 3, *why = NULL;
 

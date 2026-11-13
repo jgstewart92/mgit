@@ -1,6 +1,5 @@
 #include "mgit.h"
 
-#include <setjmp.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -51,11 +50,17 @@ void zlib_store(buf *out, const unsigned char *in, size_t n)
 	buf_add(out, t, 4);
 }
 
-/* Inflate (RFC 1951), decoding canonical Huffman codes one bit at a time. */
+/*
+ * Inflate (RFC 1951). A Huffman code of up to FAST bits is decoded in one step through a table indexed by the next
+ * FAST bits of input; a longer one (rare: up to 15 bits) one bit at a time through the canonical counts.
+ */
+
+enum { FAST = 10 };
 
 struct huff {
 	short count[16];
 	short symbol[288];
+	uint16_t fast[1 << FAST];	/* by the next FAST bits: length << 9 | symbol, 0 for a longer code */
 };
 
 struct state {
@@ -64,7 +69,7 @@ struct state {
 	uint32_t bitbuf;
 	int bitcnt;
 	buf *out;
-	jmp_buf fail;
+	int err;	/* set once the stream is found bad; sticky, and every loop that decodes checks it */
 };
 
 static int bits(struct state *s, int need)
@@ -72,8 +77,11 @@ static int bits(struct state *s, int need)
 	uint32_t v = s->bitbuf;
 
 	while (s->bitcnt < need) {
-		if (s->pos >= s->inlen)
-			longjmp(s->fail, 1);
+		if (__builtin_expect(s->pos >= s->inlen, 0)) {	/* out of input: read zeros on, and mark the stream bad */
+			s->err = 1;
+			s->bitcnt += 8;
+			continue;
+		}
 		v |= (uint32_t)s->in[s->pos++] << s->bitcnt;
 		s->bitcnt += 8;
 	}
@@ -87,6 +95,7 @@ static int construct(struct huff *h, const short *length, int n)
 	short offs[16];
 	int sym, len, left = 1;
 
+	memset(h->fast, 0, sizeof h->fast);
 	for (len = 0; len < 16; len++)
 		h->count[len] = 0;
 	for (sym = 0; sym < n; sym++)
@@ -105,10 +114,26 @@ static int construct(struct huff *h, const short *length, int n)
 	for (sym = 0; sym < n; sym++)
 		if (length[sym])
 			h->symbol[offs[length[sym]]++] = (short)sym;
+	{
+		int code = 0, idx = 0, k;
+
+		for (len = 1; len <= FAST; len++) {
+			for (k = 0; k < h->count[len]; k++, code++) {
+				int rev = 0, b, j;
+
+				for (b = 0; b < len; b++)
+					rev |= ((code >> b) & 1) << (len - 1 - b);
+				for (j = rev; j < 1 << FAST; j += 1 << len)
+					h->fast[j] = (uint16_t)(len << 9 | h->symbol[idx]);
+				idx++;
+			}
+			code <<= 1;
+		}
+	}
 	return left;
 }
 
-static int decode(struct state *s, const struct huff *h)
+static int decode_slow(struct state *s, const struct huff *h)
 {
 	int code = 0, first = 0, index = 0, len, count;
 
@@ -116,13 +141,31 @@ static int decode(struct state *s, const struct huff *h)
 		code |= bits(s, 1);
 		count = h->count[len];
 		if (code - count < first)
-			return h->symbol[index + (code - first)];
+			return s->err ? -1 : h->symbol[index + (code - first)];	/* bits ran past the input: no symbol */
 		index += count;
 		first += count;
 		first <<= 1;
 		code <<= 1;
 	}
 	return -1;
+}
+
+/* Reads ahead up to FAST bits, whole bytes, which stored blocks and the end of the stream give back. */
+static inline int decode(struct state *s, const struct huff *h)
+{
+	unsigned e;
+
+	while (s->bitcnt < FAST && s->pos < s->inlen) {
+		s->bitbuf |= (uint32_t)s->in[s->pos++] << s->bitcnt;
+		s->bitcnt += 8;
+	}
+	e = h->fast[s->bitbuf & ((1u << FAST) - 1)];
+	if (e && (int)(e >> 9) <= s->bitcnt) {
+		s->bitbuf >>= e >> 9;
+		s->bitcnt -= (int)(e >> 9);
+		return (int)(e & 511);
+	}
+	return decode_slow(s, h);
 }
 
 static const short lbase[29] = { 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31,
@@ -143,29 +186,42 @@ static void codes(struct state *s, const struct huff *lencode, const struct huff
 		size_t len, dist;
 
 		if (sym < 0)
-			longjmp(s->fail, 1);
+			{ s->err = 1; return; }
 		if (sym < 256) {
-			buf_addc(out, sym);
+			if (out->len + 2 > out->cap)
+				buf_grow(out, 1);
+			out->p[out->len++] = (unsigned char)sym;
 			continue;
 		}
-		if (sym == 256)
+		if (sym == 256) {
+			if (out->p)
+				out->p[out->len] = 0;
 			return;
+		}
 		sym -= 257;
 		if (sym >= 29)
-			longjmp(s->fail, 1);
+			{ s->err = 1; return; }
 		len = (size_t)(lbase[sym] + bits(s, lext[sym]));
 		sym = decode(s, distcode);
 		if (sym < 0 || sym >= 30)
-			longjmp(s->fail, 1);
+			{ s->err = 1; return; }
 		dist = (size_t)(dbase[sym] + bits(s, dext[sym]));
+		if (s->err)
+			return;
 		if (dist > out->len)
-			longjmp(s->fail, 1);
+			{ s->err = 1; return; }
 		buf_grow(out, len);
-		while (len--) {
-			out->p[out->len] = out->p[out->len - dist];
-			out->len++;
+		{
+			unsigned char *d = out->p + out->len;
+			const unsigned char *from = d - dist;
+
+			out->len += len;
+			if (dist >= len)
+				memcpy(d, from, len);
+			else
+				while (len--)
+					*d++ = *from++;
 		}
-		out->p[out->len] = 0;
 	}
 }
 
@@ -173,16 +229,17 @@ static void stored(struct state *s)
 {
 	size_t len;
 
+	s->pos -= (size_t)(s->bitcnt / 8);	/* whole bytes decode read ahead go back */
 	s->bitbuf = 0;
 	s->bitcnt = 0;
 	if (s->inlen - s->pos < 4)
-		longjmp(s->fail, 1);
+		{ s->err = 1; return; }
 	len = (size_t)s->in[s->pos] | (size_t)s->in[s->pos + 1] << 8;
 	if (s->in[s->pos + 2] != (~len & 0xff) || s->in[s->pos + 3] != ((~len >> 8) & 0xff))
-		longjmp(s->fail, 1);
+		{ s->err = 1; return; }
 	s->pos += 4;
 	if (s->inlen - s->pos < len)
-		longjmp(s->fail, 1);
+		{ s->err = 1; return; }
 	buf_add(s->out, s->in + s->pos, len);
 	s->pos += len;
 }
@@ -224,26 +281,26 @@ static void dynamic(struct state *s)
 	ndist = bits(s, 5) + 1;
 	ncode = bits(s, 4) + 4;
 	if (nlen > 286 || ndist > 30)
-		longjmp(s->fail, 1);
+		{ s->err = 1; return; }
 	for (index = 0; index < ncode; index++)
 		lengths[order[index]] = (short)bits(s, 3);
 	for (; index < 19; index++)
 		lengths[order[index]] = 0;
 	if (construct(&lencode, lengths, 19) != 0)
-		longjmp(s->fail, 1);
+		{ s->err = 1; return; }
 	index = 0;
 	while (index < nlen + ndist) {
 		int sym = decode(s, &lencode), len = 0, rep;
 
 		if (sym < 0)
-			longjmp(s->fail, 1);
+			{ s->err = 1; return; }
 		if (sym < 16) {
 			lengths[index++] = (short)sym;
 			continue;
 		}
 		if (sym == 16) {
 			if (index == 0)
-				longjmp(s->fail, 1);
+				{ s->err = 1; return; }
 			len = lengths[index - 1];
 			rep = 3 + bits(s, 2);
 		} else if (sym == 17) {
@@ -252,18 +309,20 @@ static void dynamic(struct state *s)
 			rep = 11 + bits(s, 7);
 		}
 		if (index + rep > nlen + ndist)
-			longjmp(s->fail, 1);
+			{ s->err = 1; return; }
 		while (rep--)
 			lengths[index++] = (short)len;
 	}
+	if (s->err)
+		return;
 	if (lengths[256] == 0)
-		longjmp(s->fail, 1);
+		{ s->err = 1; return; }
 	err = construct(&lencode, lengths, nlen);
 	if (err < 0 || (err > 0 && nlen - lencode.count[0] != 1))
-		longjmp(s->fail, 1);
+		{ s->err = 1; return; }
 	err = construct(&distcode, lengths + nlen, ndist);
 	if (err < 0 || (err > 0 && ndist - distcode.count[0] != 1))
-		longjmp(s->fail, 1);
+		{ s->err = 1; return; }
 	codes(s, &lencode, &distcode);
 }
 
@@ -291,11 +350,12 @@ int zlib_inflate_prefix(buf *out, const unsigned char *in, size_t n, size_t *use
 	s.bitbuf = 0;
 	s.bitcnt = 0;
 	s.out = out;
-	if (setjmp(s.fail))
-		return -1;
+	s.err = 0;
 	do {
 		last = bits(&s, 1);
 		type = bits(&s, 2);
+		if (s.err)
+			return -1;
 		if (type == 0)
 			stored(&s);
 		else if (type == 1)
@@ -304,7 +364,10 @@ int zlib_inflate_prefix(buf *out, const unsigned char *in, size_t n, size_t *use
 			dynamic(&s);
 		else
 			return -1;
+		if (s.err)
+			return -1;
 	} while (!last);
+	s.pos -= (size_t)(s.bitcnt / 8);	/* the bytes decode read ahead are the trailer's */
 	if (n - s.pos < 4)
 		return -1;
 	want = (uint32_t)in[s.pos] << 24 | (uint32_t)in[s.pos + 1] << 16 | (uint32_t)in[s.pos + 2] << 8 | in[s.pos + 3];
