@@ -2016,5 +2016,656 @@ if cc -std=c23 -O2 -ffp-contract=off -c -Dmain=mgit_main -o "$tmp/f1-main.o" "$h
 else
 	bad "the apply_delta driver did not compile"
 fi
+
+# ---- 6.1.3 ----
+# 35. chains and trees with no end: a delta cycle through REF_DELTA ids, chains at and past the limits, trees nested past
+# git's own depth limit. The packs are written by a small driver linked with this tree's sha1, deflate and crc.
+cat > "$tmp/r1.c" <<'EOF'
+#include "mgit.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+struct ent { unsigned char id[20]; uint64_t off; uint32_t crc; };
+struct pk { buf b; struct ent *e; size_t n; };
+
+static void be32(unsigned char *p, uint32_t v) { p[0] = v >> 24; p[1] = (v >> 16) & 255; p[2] = (v >> 8) & 255; p[3] = v & 255; }
+static void pk_start(struct pk *p, size_t count)
+{
+	unsigned char h[12];
+
+	memset(p, 0, sizeof *p);
+	memcpy(h, "PACK", 4);
+	be32(h + 4, 2);
+	be32(h + 8, (uint32_t)count);
+	buf_add(&p->b, h, 12);
+	p->e = calloc(count + 1, sizeof *p->e);
+}
+/* type: 1-4 an object, 6 OFS_DELTA (back), 7 REF_DELTA (base). Returns the entry's offset. */
+static uint64_t put(struct pk *p, const unsigned char id[20], int type, uint64_t back, const unsigned char base[20], const void *body, size_t len)
+{
+	uint64_t off = p->b.len;
+	size_t s = len;
+	buf z = { 0 };
+
+	buf_addc(&p->b, (int)(type << 4 | (s & 15) | (s > 15 ? 0x80 : 0)));
+	for (s >>= 4; s; s >>= 7)
+		buf_addc(&p->b, (int)((s & 127) | (s > 127 ? 0x80 : 0)));
+	if (type == 6) {
+		unsigned char o[12];
+		int j = 11;
+
+		o[j] = back & 127;
+		while (back >>= 7)
+			o[--j] = (unsigned char)(128 | (--back & 127));
+		buf_add(&p->b, o + j, (size_t)(12 - j));
+	} else if (type == 7) {
+		buf_add(&p->b, base, 20);
+	}
+	zlib_compress(&z, body, len);
+	buf_add(&p->b, z.p, z.len);
+	buf_free(&z);
+	memcpy(p->e[p->n].id, id, 20);
+	p->e[p->n].off = off;
+	p->e[p->n++].crc = crc32_update(0, p->b.p + off, (size_t)(p->b.len - off));
+	return off;
+}
+static int by_id(const void *a, const void *b) { return memcmp(((const struct ent *)a)->id, ((const struct ent *)b)->id, 20); }
+static void sum(const void *d, size_t n, unsigned char out[20])
+{
+	sha1_ctx c;
+
+	sha1_init(&c);
+	sha1_update(&c, d, n);
+	sha1_final(&c, out);
+}
+static void save(const char *dir, const char *name, const void *d, size_t n)
+{
+	buf path = { 0 };
+	FILE *f;
+
+	buf_printf(&path, "%s/%s", dir, name);
+	f = fopen((char *)path.p, "wb");
+	if (!f || fwrite(d, 1, n, f) != n || fclose(f))
+		exit(3);
+	buf_free(&path);
+}
+static void pk_end(struct pk *p, const char *dir, const char *stem)
+{
+	size_t n = p->n, xn = 1032 + n * 28 + 40, i;
+	unsigned char *x = calloc(xn, 1), t[20];
+	uint32_t fan[256] = { 0 };
+	buf name = { 0 };
+
+	sum(p->b.p, p->b.len, t);
+	buf_add(&p->b, t, 20);
+	qsort(p->e, n, sizeof *p->e, by_id);
+	memcpy(x, "\377tOc", 4);
+	be32(x + 4, 2);
+	for (i = 0; i < n; i++)
+		fan[p->e[i].id[0]]++;
+	for (i = 0; i < 256; i++) {
+		fan[i] += i ? fan[i - 1] : 0;
+		be32(x + 8 + 4 * i, fan[i]);
+	}
+	for (i = 0; i < n; i++) {
+		memcpy(x + 1032 + 20 * i, p->e[i].id, 20);
+		be32(x + 1032 + 20 * n + 4 * i, p->e[i].crc);
+		be32(x + 1032 + 24 * n + 4 * i, (uint32_t)p->e[i].off);
+	}
+	memcpy(x + xn - 40, t, 20);
+	sum(x, xn - 20, x + xn - 20);
+	buf_printf(&name, "pack-%s.pack", stem);
+	save(dir, (char *)name.p, p->b.p, p->b.len);
+	name.len = 0;
+	buf_printf(&name, "pack-%s.idx", stem);
+	save(dir, (char *)name.p, x, xn);
+	buf_free(&name);
+	free(x);
+}
+static size_t varint(unsigned char *o, size_t v)
+{
+	size_t k = 0;
+
+	do {
+		o[k++] = (unsigned char)((v & 127) | (v > 127 ? 128 : 0));
+		v >>= 7;
+	} while (v);
+	return k;
+}
+/* A delta from any base of slen bytes to t: t's bytes as literal inserts. */
+static size_t mkdelta(unsigned char *o, size_t slen, const char *t, size_t tlen)
+{
+	size_t k = varint(o, slen), i;
+
+	k += varint(o + k, tlen);
+	for (i = 0; i < tlen;) {
+		size_t c = tlen - i > 127 ? 127 : tlen - i;
+
+		o[k++] = (unsigned char)c;
+		memcpy(o + k, t + i, c);
+		k += c;
+		i += c;
+	}
+	return k;
+}
+static void show(const unsigned char id[20])
+{
+	char hex[41];
+
+	id_to_hex(id, hex);
+	puts(hex);
+}
+
+int main(int argc, char **argv)
+{
+	const char *kind = argv[1], *dir = argv[2];
+	long n = argc > 3 ? atol(argv[3]) : 0, i;
+	unsigned char a[20], b[20], cur[20], prev[20], d[256];
+	size_t dn = mkdelta(d, 5, "hello", 5);
+	struct pk p, q;
+
+	memset(a, 0xab, 20);
+	memset(b, 0xcd, 20);
+	if (!strcmp(kind, "self")) {		/* a REF_DELTA naming its own id */
+		pk_start(&p, 1);
+		put(&p, a, 7, 0, a, d, dn);
+		pk_end(&p, dir, "self");
+		show(a);
+	} else if (!strcmp(kind, "two")) {	/* two naming each other */
+		pk_start(&p, 2);
+		put(&p, a, 7, 0, b, d, dn);
+		put(&p, b, 7, 0, a, d, dn);
+		pk_end(&p, dir, "two");
+		show(a);
+	} else if (!strcmp(kind, "mix")) {	/* an OFS_DELTA on a REF_DELTA that names the OFS_DELTA */
+		uint64_t at;
+
+		pk_start(&p, 2);
+		at = put(&p, a, 7, 0, b, d, dn);
+		put(&p, b, 6, p.b.len - at, NULL, d, dn);
+		pk_end(&p, dir, "mix");
+		show(b);
+	} else if (!strcmp(kind, "xpack")) {	/* the same across two packs */
+		pk_start(&p, 1);
+		put(&p, a, 7, 0, b, d, dn);
+		pk_end(&p, dir, "xa");
+		pk_start(&q, 1);
+		put(&q, b, 7, 0, a, d, dn);
+		pk_end(&q, dir, "xb");
+		show(a);
+	} else if (!strcmp(kind, "badbase")) {	/* a base found by id whose bytes do not hash to that id */
+		pk_start(&p, 2);
+		put(&p, a, 3, 0, NULL, "hello", 5);
+		object_hash(OBJ_BLOB, "world", 5, cur);
+		dn = mkdelta(d, 5, "world", 5);
+		put(&p, cur, 7, 0, a, d, dn);
+		pk_end(&p, dir, "bad");
+		show(cur);
+	} else if (!strcmp(kind, "loosebase")) {	/* a base that is a loose object: "base\n" */
+		object_hash(OBJ_BLOB, "base\n", 5, a);
+		object_hash(OBJ_BLOB, "built", 5, cur);
+		dn = mkdelta(d, 5, "built", 5);
+		pk_start(&p, 1);
+		put(&p, cur, 7, 0, a, d, dn);
+		pk_end(&p, dir, "loose");
+		show(cur);
+	} else if (!strcmp(kind, "dup")) {	/* one object twice, the second a REF_DELTA on its own id; a tree and a commit */
+		char c[256];
+		unsigned char t[64];
+		size_t tn, cn;
+		char hex[41];
+
+		object_hash(OBJ_BLOB, "hello", 5, a);
+		pk_start(&p, 4);
+		put(&p, a, 3, 0, NULL, "hello", 5);
+		put(&p, a, 7, 0, a, d, dn);
+		tn = 9;
+		memcpy(t, "100644 f", 9);
+		memcpy(t + tn, a, 20);
+		tn += 20;
+		object_hash(OBJ_TREE, t, tn, b);
+		put(&p, b, 2, 0, NULL, t, tn);
+		id_to_hex(b, hex);
+		cn = (size_t)snprintf(c, sizeof c, "tree %s\nauthor A <a@example.com> 1800000000 +0000\ncommitter A <a@example.com> 1800000000 +0000\n\ndup\n", hex);
+		object_hash(OBJ_COMMIT, c, cn, cur);
+		put(&p, cur, 1, 0, NULL, c, cn);
+		pk_end(&p, dir, "dup");
+		show(cur);
+	} else if (!strcmp(kind, "deeptree")) {	/* n trees, each holding the next; a file in the last; one commit */
+		char c[256];
+		unsigned char t[64];
+		size_t tn, cn;
+		char hex[41];
+
+		pk_start(&p, (size_t)n + 2);
+		object_hash(OBJ_BLOB, "deep\n", 5, prev);
+		put(&p, prev, 3, 0, NULL, "deep\n", 5);
+		for (i = 0; i < n; i++) {
+			tn = i ? 8 : 9;
+			memcpy(t, i ? "40000 d" : "100644 f", tn);
+			memcpy(t + tn, prev, 20);
+			tn += 20;
+			object_hash(OBJ_TREE, t, tn, cur);
+			put(&p, cur, 2, 0, NULL, t, tn);
+			memcpy(prev, cur, 20);
+		}
+		id_to_hex(prev, hex);
+		cn = (size_t)snprintf(c, sizeof c, "tree %s\nauthor A <a@example.com> 1800000000 +0000\ncommitter A <a@example.com> 1800000000 +0000\n\ndeep\n", hex);
+		object_hash(OBJ_COMMIT, c, cn, cur);
+		put(&p, cur, 1, 0, NULL, c, cn);
+		pk_end(&p, dir, "deep");
+		show(cur);
+	} else {				/* a blob and n deltas on it, each on the last */
+		int ofs = !strcmp(kind, "ofschain"), mix = !strcmp(kind, "mixchain"), x = !strcmp(kind, "xchain");
+		char body[64];
+		size_t plen, clen;
+		uint64_t at = 0;
+
+		pk_start(&p, x ? (size_t)n / 2 + 1 : (size_t)n + 1);
+		if (x)
+			pk_start(&q, (size_t)(n + 1) / 2);
+		plen = (size_t)snprintf(body, sizeof body, "revision 0\n");
+		object_hash(OBJ_BLOB, body, plen, prev);
+		at = put(&p, prev, 3, 0, NULL, body, plen);
+		for (i = 1; i <= n; i++) {
+			clen = (size_t)snprintf(body, sizeof body, "revision %ld\n", i);
+			object_hash(OBJ_BLOB, body, clen, cur);
+			dn = mkdelta(d, plen, body, clen);
+			if (x)
+				put(i & 1 ? &q : &p, cur, 7, 0, prev, d, dn);
+			else if (ofs || (mix && (i & 1)))
+				at = put(&p, cur, 6, p.b.len - at, NULL, d, dn);
+			else
+				at = put(&p, cur, 7, 0, prev, d, dn);
+			memcpy(prev, cur, 20);
+			plen = clen;
+		}
+		pk_end(&p, dir, "chain");
+		if (x)
+			pk_end(&q, dir, "chain2");
+		show(prev);
+	}
+	return 0;
+}
+EOF
+if cc -std=c23 -O2 -ffp-contract=off -I"$here/src" -o "$tmp/r1" "$tmp/r1.c" "$here/src/pack.c" "$tmp/f1-main.o" "$@" 2>"$tmp/r1.err"; then
+	r1new() { r=$tmp/r1-$1; $GIT init -q -b main "$r"; }	# a fresh repository named $1, in $r
+	said() { printf '%s %s' "$1" "$(printf '%s\n' "$2" | grep -c "$3")"; }	# status, and how many lines say what is wanted
+	# a cycle is refused where it was found, whichever way it runs
+	for kind in self two mix xpack; do
+		r1new "$kind"
+		id=$("$tmp/r1" $kind "$r/.git/objects/pack")
+		out=$(in_mg "$r" cat-file -p "$id" 2>&1)
+		same "a delta cycle ($kind) is refused, not followed until the stack runs out" "128 1" "$(said $? "$out" 'corrupt object')"
+	done
+	# chains of git's greatest length, on a stack far too small for one frame per delta
+	for kind in refchain ofschain mixchain xchain; do
+		r1new "$kind"
+		id=$("$tmp/r1" $kind "$r/.git/objects/pack" 4095)
+		same "$kind: 4095 deltas read on a 256 KiB stack" "revision 4095" \
+			"$(cd "$r" && (ulimit -s 256; timeout 60 "$MGIT" cat-file blob "$id" 2>&1))"
+		# git follows a REF_DELTA only within its own pack, so it can only be asked about the chains in one pack
+		[ $kind = xchain ] || same "$kind: git reads the same 4095 deltas" "revision 4095" "$(in_git "$r" cat-file blob "$id")"
+	done
+	# the limit itself: 10000 deltas is the most mgit follows, through ids or offsets
+	for kind in refchain ofschain xchain; do
+		r1new "$kind-10000"
+		id=$("$tmp/r1" $kind "$r/.git/objects/pack" 10000)
+		same "$kind: 10000 deltas read" "revision 10000" "$(in_mg "$r" cat-file blob "$id" 2>&1)"
+		r1new "$kind-10001"
+		id=$("$tmp/r1" $kind "$r/.git/objects/pack" 10001)
+		out=$(in_mg "$r" cat-file -p "$id" 2>&1)
+		same "$kind: 10001 deltas are refused" "128 1" "$(said $? "$out" 'corrupt object')"
+	done
+	# a base reached by id is still held to that id, and is still found loose
+	r1new badbase
+	id=$("$tmp/r1" badbase "$r/.git/objects/pack")
+	out=$(in_mg "$r" cat-file -p "$id" 2>&1)
+	same "a base found by id must hash to that id" "128 1" "$(said $? "$out" 'hash mismatch')"
+	r1new loosebase
+	printf 'base\n' | in_git "$r" hash-object -w --stdin > /dev/null
+	id=$("$tmp/r1" loosebase "$r/.git/objects/pack")
+	same "a REF_DELTA on a loose base reads" "built" "$(in_mg "$r" cat-file -p "$id" 2>&1)"
+	# canned_from REPO PACK: REPO's advertisement, NAK, then PACK, as canned does for the bare source
+	canned_from() {
+		printf 0000 | /usr/bin/git-upload-pack "$1" > "$fb/canned"
+		printf '0008NAK\n' >> "$fb/canned"
+		rm -rf "$tmp/sb" && mkdir "$tmp/sb" && split -b 65000 "$2" "$tmp/sb/x"
+		for ch in "$tmp"/sb/x*; do printf '%04x\001' $(($(wc -c < "$ch") + 5)); cat "$ch"; done >> "$fb/canned"
+		printf 0000 >> "$fb/canned"
+	}
+	# from a fetch: the one way a pack can bring a REF_DELTA on its own id is to hold that object twice
+	r1new dup
+	id=$("$tmp/r1" dup "$r/.git/objects/pack")
+	in_git "$r" update-ref refs/heads/main "$id"
+	canned_from "$r" "$r/.git/objects/pack/pack-dup.pack"
+	refused "a pack holding an object twice, once as a delta on itself" "the pack that came is refused"
+	# trees: git's limit is 2048 below the root, and mgit's is the same
+	r1new deep2049
+	id=$("$tmp/r1" deeptree "$r/.git/objects/pack" 2049)
+	in_git "$r" update-ref refs/heads/main "$id"
+	if in_git "$r" ls-tree -r main > /dev/null 2>&1; then ok "git reads trees 2048 below the root"; else bad "git refused trees 2048 below the root"; fi
+	same "mgit reads trees 2048 below the root" "0 0" "$(out=$(in_mg "$r" log --stat -1 2>&1); said $? "$out" 'nested more than')"
+	r1new deep2050
+	id=$("$tmp/r1" deeptree "$r/.git/objects/pack" 2050)
+	in_git "$r" update-ref refs/heads/main "$id"
+	fails "git refuses trees 2049 below the root" in_git "$r" ls-tree -r main
+	for cmd in "status" "log --stat -1" "check"; do
+		out=$(in_mg "$r" $cmd 2>&1)
+		same "$cmd refuses trees 2049 below the root" "128 1" "$(said $? "$out" 'nested more than 2048 deep')"
+	done
+	# far past any stack, by every way a tree is walked: here, from a path, and from a far side
+	r1new deep100k
+	id=$("$tmp/r1" deeptree "$r/.git/objects/pack" 100000)
+	in_git "$r" update-ref refs/heads/main "$id"
+	for cmd in "status" "log --stat -1" "check"; do
+		out=$(in_mg "$r" $cmd 2>&1)
+		same "$cmd refuses trees 100000 deep" "128 1" "$(said $? "$out" 'nested more than 2048 deep')"
+	done
+	out=$(cd "$tmp" && mg clone "$r" r1-path-clone 2>&1)
+	same "clone from a path refuses trees 100000 deep, leaving nothing" "128 1 absent" "$(said $? "$out" 'nested more than 2048 deep') $([ -e "$tmp/r1-path-clone" ] || echo absent)"
+	canned_from "$r" "$r/.git/objects/pack/pack-deep.pack"
+	refused "trees 100000 deep from a far side" "nested more than 2048 deep"
+	# a .gitignore line can be any length, and each wildcard in it costs the matcher a frame
+	r1new wm
+	awk 'BEGIN { for (i = 0; i < 1000000; i++) printf "**/"; print "x" }' > "$r/.gitignore"
+	printf 'kept\n' > "$r/somefile"
+	out=$(in_mg "$r" status 2>&1)
+	same "status survives a .gitignore line of a million wildcards" "0 1" "$(said $? "$out" 'somefile')"
+	# and past the limit the match gives up at once, rather than trying every other way through 5000 wildcards
+	r1new wmlong
+	awk 'BEGIN { for (i = 0; i < 5000; i++) printf "*a"; print "" }' > "$tmp/wm.pat"
+	wb=$(in_git "$r" hash-object -w "$tmp/wm.pat")
+	wn=$(awk 'BEGIN { for (i = 0; i < 5000; i++) printf "a" }')
+	wt=$(printf '100644 blob %s\t.gitignore\n100644 blob %s\t%s\n' "$wb" "$wb" "$wn" | in_git "$r" mktree --missing)
+	in_git "$r" update-ref refs/heads/main "$(in_git "$r" commit-tree -m wm "$wt")"
+	in_mg "$r" check > /dev/null 2>&1
+	st=$?
+	case $st in 0 | 1) ok "check ends on 5000 wildcards against a long name" ;; *) bad "check on 5000 wildcards: status $st" ;; esac
+else
+	bad "the delta-chain driver did not compile"
+	cat "$tmp/r1.err"
+fi
+
+# ---- 6.1.4 ----
+# 37. what two outside reviews of 6.1.3 found (Opus 5.5 and Fable 5.2; their claims and the inputs that showed each
+# are in claims.tsv beside the 6.1.4 report). Hostile far sides through the canned host, crafted objects through git
+# hash-object --literally, git as the referee.
+cp "$here/check.conf" "$XDG_CONFIG_HOME/mgit/check.conf"
+r4=$tmp/v614
+mkdir -p "$r4"
+$GIT init -q -b main "$r4/src" && printf 'x\n' > "$r4/src/x" && $GIT -C "$r4/src" add -A && $GIT -C "$r4/src" commit -q -m Start
+x4=$($GIT -C "$r4/src" rev-parse main)
+echo main | $GIT -C "$r4/src" pack-objects -q --revs --stdout > "$r4/main.pack"
+sb4() {	# PACK as side-band-64k band 1 packets and a flush
+	rm -rf "$tmp/sb" && mkdir "$tmp/sb" && split -b 65000 "$1" "$tmp/sb/x"
+	for ch in "$tmp"/sb/x*; do printf '%04x\001' $(($(wc -c < "$ch") + 5)); cat "$ch"; done
+	printf 0000
+}
+advert4() {	# the canned answer: HEAD and main at the source's commit, symref=HEAD:$1 and a ref named $1 at the same id
+	caps="multi_ack_detailed side-band-64k ofs-delta symref=HEAD:$1 agent=git/test" l1="$x4 HEAD" l2="$x4 $1" l3="$x4 refs/heads/main"
+	printf '%04x%s\000%s\n' $((${#l1} + ${#caps} + 6)) "$l1" "$caps"
+	printf '%04x%s\n%04x%s\n0000' $((${#l2} + 5)) "$l2" $((${#l3} + 5)) "$l3"
+	printf '0008NAK\n'
+	sb4 "$r4/main.pack"
+}
+# F1 (both): the far side's default branch is held to the ref name rules; a bad symref is passed over, as git does
+mkdir -p "$r4/a"
+(export LC_ALL=C; advert4 'refs/heads/../../../../evil') > "$fb/canned"
+(cd "$r4/a" && mg clone canned:x c > /dev/null 2>&1)
+same "clone: a symref to refs/heads/../../../../evil writes nothing outside the clone, which takes main" "0 absent refs/heads/main" \
+	"$? $([ -e "$r4/a/evil" ] && echo present || echo absent) $($GIT -C "$r4/a/c" symbolic-ref HEAD 2>&1)"
+(export LC_ALL=C; advert4 "refs/heads/a\"]
+[core]
+	fsmonitor=$r4/hook
+#") > "$fb/canned"
+(cd "$r4" && mg clone canned:x inj > /dev/null 2>&1)
+same "clone: a default branch named with newlines puts nothing into .git/config" "0 unset main" \
+	"$? $($GIT -C "$r4/inj" config --local core.fsmonitor > /dev/null 2>&1 && echo set || echo unset) $($GIT -C "$r4/inj" config branch.main.merge | cut -c12-)"
+# F10 (Fable): a branch name holding '"' is escaped in [branch "..."], so git can read the config
+$GIT init -q -b 'q"b' "$r4/qsrc" && printf 'x\n' > "$r4/qsrc/x" && $GIT -C "$r4/qsrc" add -A && $GIT -C "$r4/qsrc" commit -q -m Start
+mg clone "$r4/qsrc" "$r4/q" > /dev/null 2>&1
+same "clone: a default branch named q\"b gives a config git reads" "origin refs/heads/q\"b" \
+	"$($GIT -C "$r4/q" config 'branch.q"b.remote' 2>&1) $($GIT -C "$r4/q" config 'branch.q"b.merge' 2>&1)"
+# F2 (Fable): a NUL in a .gitattributes line no longer stops its scan from moving on
+$GIT init -q -b main "$r4/attr" && printf 'a\000\n' > "$r4/attr/.gitattributes" && $GIT -C "$r4/attr" add -A && $GIT -C "$r4/attr" commit -q -m Start
+timeout 10 "$MGIT" clone "$r4/attr" "$r4/attr-c" > /dev/null 2>&1
+same "clone: a NUL in .gitattributes is read past, not looped on" 0 $?
+# F4 (Fable): a pack that fails the connectivity check is not kept, so a second fetch cannot take it for complete
+$GIT clone -q --bare "$r4/src" "$r4/f.git" 2>/dev/null
+mg clone "$r4/f.git" "$r4/f" > /dev/null 2>&1
+$GIT -C "$r4/f" config remote.origin.url canned:x
+(cd "$r4/src" && printf '2\n' > x && $GIT commit -q -a -m Two && $GIT push -q "$r4/f.git" main)
+x4b=$($GIT -C "$r4/f.git" rev-parse main)
+echo "$x4b" | $GIT -C "$r4/f.git" pack-objects -q --stdout > "$r4/commit-only.pack"
+{ printf 0000 | /usr/bin/git-upload-pack "$r4/f.git"; printf '0008NAK\n0008NAK\n'; sb4 "$r4/commit-only.pack"; } > "$fb/canned"
+packs=$(ls "$r4/f/.git/objects/pack" | wc -l)
+(cd "$r4/f" && mg fetch > /dev/null 2>&1; mg fetch > /dev/null 2>&1)
+same "fetch: a pack of a commit without its tree is not kept, and a second fetch moves no ref" "$packs 1" \
+	"$(ls "$r4/f/.git/objects/pack" | wc -l) $($GIT -C "$r4/f" rev-parse -q --verify refs/remotes/origin/main > /dev/null && [ "$($GIT -C "$r4/f" rev-parse refs/remotes/origin/main)" != "$x4b" ] && echo 1)"
+# F6 (Opus): a fetch line mapping onto the checked-out branch is refused, as git refuses it
+$GIT -C "$r4/f" config remote.origin.url "$r4/f.git"
+$GIT -C "$r4/f" config --replace-all remote.origin.fetch '+refs/heads/*:refs/heads/*'
+(cd "$r4/f" && mg fetch > "$r4/head.out" 2>&1)
+same "fetch: the checked-out branch is not moved under its working tree" "1 $x4" "$? $($GIT -C "$r4/f" rev-parse main)"
+# F5 (both): an entry is inflated no further than the size it states: one declaring 10 bytes that inflates to 256 MiB
+id=$(head -c 268435456 /dev/zero | $GIT -C "$r4/src" hash-object -w --stdin)
+echo "$id" | $GIT -C "$r4/src" pack-objects -q --stdout > "$r4/big.pack"
+n=$(stat -c %s "$r4/big.pack") h=1
+while [ $(( $(od -An -tu1 -j $((11 + h)) -N1 "$r4/big.pack") & 128 )) != 0 ]; do h=$((h + 1)); done
+{ head -c 12 "$r4/big.pack"; hexb 3a; tail -c +$((13 + h)) "$r4/big.pack" | head -c $((n - 32 - h)); } > "$r4/body"
+{ cat "$r4/body"; hexb "$(sha1sum "$r4/body" | cut -c1-40)"; } > "$r4/bomb.pack"
+{ printf 0000 | /usr/bin/git-upload-pack "$r4/f.git"; printf '0008NAK\n'; sb4 "$r4/bomb.pack"; } > "$fb/canned"
+out=$(cd "$r4" && ulimit -v 400000 && timeout 60 "$MGIT" clone canned:x bomb 2>&1)
+same "clone: an entry stating 10 bytes that inflates to 256 MiB is refused, under a 400 MB address-space limit" "128 1" \
+	"$? $(printf '%s\n' "$out" | grep -c 'does not inflate to its stated size')"
+# F4 (Opus): a commit's tree is its first line and its parents the lines right after it, as git reads them
+$GIT init -q -b main "$r4/two"
+printf 'tree A\n' > "$r4/two/f" && in_git "$r4/two" add -A && ta=$(in_git "$r4/two" write-tree)
+printf 'tree B\n' > "$r4/two/f" && in_git "$r4/two" add -A && tb=$(in_git "$r4/two" write-tree)
+c=$(printf 'tree %s\nauthor A <a@example.com> 1800000000 +0000\ncommitter A <a@example.com> 1800000000 +0000\ntree %s\n\nTwo trees\n' "$ta" "$tb" |
+	in_git "$r4/two" hash-object -t commit -w --literally --stdin)
+in_git "$r4/two" update-ref refs/heads/main "$c"
+mg clone "$r4/two" "$r4/two-c" > /dev/null 2>&1
+same "clone: a commit with a second tree line checks out the first, as git clone does" "tree A" "$(cat "$r4/two-c/f" 2>&1)"
+p=$(printf 'tree %s\nauthor A <a@example.com> 1800000000 +0000\ncommitter A <a@example.com> 1800000000 +0000\nparent %s\n\nLate parent\n' "$ta" "$c" |
+	in_git "$r4/two" hash-object -t commit -w --literally --stdin)
+same "log: a parent line after the committer is no parent, as git reads it" "$(in_git "$r4/two" rev-list "$p")" "$(in_mg "$r4/two" log --format=%H "$p")"
+# F3 (Opus): names git add refuses (.git in any case, and NTFS's git~1 and .git.) are skipped by commit, with a warning
+mg init "$r4/dg" > /dev/null
+for d in .GIT git~1 .git. .Git; do mkdir "$r4/dg/$d" && printf 'x\n' > "$r4/dg/$d/f"; done
+printf 'r\n' > "$r4/dg/r"
+out=$(in_mg "$r4/dg" commit -q -m Start 2>&1)
+same "commit: .GIT, git~1, .git. and .Git are left out, each with a warning, and status still reads HEAD" "r 4 0" \
+	"$(in_git "$r4/dg" ls-tree --name-only HEAD | tr '\n' ' ' | sed 's/ $//') $(printf '%s\n' "$out" | grep -c 'git refuses that name') $(in_mg "$r4/dg" status > /dev/null 2>&1; echo $?)"
+# F12 (Fable): a tracked directory that gains its own .git keeps its tracked files, as git add -A keeps them
+mg init "$r4/vd" > /dev/null && mkdir "$r4/vd/vendor" && printf 'v\n' > "$r4/vd/vendor/lib.c" && in_mg "$r4/vd" commit -q -m Start
+$GIT init -q "$r4/vd/vendor" && printf 'v2\n' > "$r4/vd/vendor/lib.c"
+in_mg "$r4/vd" commit -q -m Change > /dev/null 2>&1
+same "commit: a tracked directory that gains a .git keeps its files" "v2" "$(in_git "$r4/vd" show HEAD:vendor/lib.c 2>&1)"
+# F6, F7 (Fable): commit refuses a sparse checkout's index and a merge in progress
+$GIT init -q -b main "$r4/sp" && mkdir "$r4/sp/in" "$r4/sp/out" && printf 'a\n' > "$r4/sp/in/a" && printf 'b\n' > "$r4/sp/out/b"
+(cd "$r4/sp" && $GIT add -A && $GIT commit -q -m Start && $GIT sparse-checkout set in && printf 'a2\n' > in/a)
+before=$(in_git "$r4/sp" rev-parse HEAD)
+out=$(in_mg "$r4/sp" commit -q -m Change 2>&1)
+same "commit: an index with skip-worktree entries is refused, not taken as files deleted" "128 1 $before" \
+	"$? $(printf '%s\n' "$out" | grep -c 'skip-worktree') $(in_git "$r4/sp" rev-parse HEAD)"
+$GIT init -q -b main "$r4/mh" && printf '1\n2\n3\n' > "$r4/mh/f"
+(cd "$r4/mh" && $GIT add -A && $GIT commit -q -m Start && $GIT checkout -q -b side && printf '1\n2\nside\n' > f && $GIT commit -q -a -m Side &&
+	$GIT checkout -q main && printf 'main\n2\n3\n' > f && $GIT commit -q -a -m Main && $GIT merge -q --no-commit side) > /dev/null 2>&1
+before=$(in_git "$r4/mh" rev-parse HEAD)
+out=$(in_mg "$r4/mh" commit -q -m Merge 2>&1)
+same "commit: a merge in progress (MERGE_HEAD) is refused" "128 1 $before" "$? $(printf '%s\n' "$out" | grep -c 'MERGE_HEAD exists') $(in_git "$r4/mh" rev-parse HEAD)"
+# F8 (Fable): a lock is removed when the command dies holding it (the index write fails: a 1 KiB file-size limit)
+mg init "$r4/lk" > /dev/null
+i=0; while [ $i -lt 60 ]; do printf 'x' > "$r4/lk/file-with-a-long-name-$i"; i=$((i + 1)); done
+(cd "$r4/lk" && trap '' XFSZ && ulimit -f 1 && timeout 60 "$MGIT" commit -q -m Start) > /dev/null 2>&1
+same "commit: a failed index write leaves no index.lock" "128 0" "$? $(find "$r4/lk/.git" -name '*.lock' | wc -l)"
+# F8, F11 (Opus), F11, F15 (Fable): check refuses a commit whose tree is not a tree, and judges only refs/tags/ as tags
+mg init "$r4/ck" > /dev/null && printf 'x\n' > "$r4/ck/x" && in_mg "$r4/ck" commit -q -m Start
+in_git "$r4/ck" update-ref refs/remotes/origin/main HEAD
+same "check: a remote-tracking ref is no tag" 0 "$(in_mg "$r4/ck" check refs/remotes/origin/main > /dev/null 2>&1; echo $?)"
+bl=$(printf '100644 x\00012345' | in_git "$r4/ck" hash-object -w --stdin)
+c=$(printf 'tree %s\nauthor A <a@example.com> 1800000000 +0000\ncommitter A <a@example.com> 1800000000 +0000\n\nBlob as tree\n' "$bl" |
+	in_git "$r4/ck" hash-object -t commit -w --literally --stdin)
+in_git "$r4/ck" update-ref refs/heads/main "$c"
+out=$(in_mg "$r4/ck" check 2>&1)
+same "check: a commit whose tree is a blob is refused, not read as a tree" "128 1" "$? $(printf '%s\n' "$out" | grep -c 'expected a tree, found a blob')"
+# F9 (Fable): the shipped allow rules are met by the address itself, not by a path that holds a placeholder domain
+fn='notes@example.com'.txt; ad='real.person@'corp.io
+mg init "$r4/al" > /dev/null && printf 'mail %s\n' "$ad" > "$r4/al/$fn" && in_mg "$r4/al" commit -q -m Start
+same "check: a real address in a file named after an example address is refused by the shipped rules" "1 1" \
+	"$(in_mg "$r4/al" check > "$r4/al.out" 2>&1; echo $?) $(grep -cF "$fn:1: mail $ad" "$r4/al.out")"
+# F10 (Opus): what a far side says on band 2 reaches the terminal with its control characters shown as ^X, as git shows them
+echo main | $GIT -C "$r4/src" pack-objects -q --revs --stdout > "$r4/esc.pack"
+msg=$(printf '\002\033]0;x\007\033[2Jhello\n')
+{ printf 0000 | /usr/bin/git-upload-pack "$r4/src"; printf '0008NAK\n'; printf '%04x%s' $((${#msg} + 4)) "$msg"; sb4 "$r4/esc.pack"; } > "$fb/canned"
+(cd "$r4" && mg clone canned:x esc > "$r4/esc.out" 2>&1)
+same "clone: band 2 text is shown with ^[ for ESC, no raw escape byte" "0 0 1" "$? $(tr -cd '\033' < "$r4/esc.out" | wc -c) $(grep -c '\^\[\[2Jhello' "$r4/esc.out")"
+# F11, F21 and F14 (the reviews): curl takes a url as written (--globoff) and shows no proxy's CONNECT headers
+: > "$fb/curl-args"
+mg clone "https://standin$cb" "$r4/https" > /dev/null 2>&1
+same "clone https: curl runs with --globoff and --suppress-connect-headers" "0 yes" \
+	"$? $(awk '!/--globoff/ || !/--suppress-connect-headers/ { n++ } END { print NR && !n ? "yes" : "no" }' "$fb/curl-args")"
+# F22 (Fable): a push to a path refuses a branch checked out in a linked worktree there, as git does
+$GIT init -q -b main "$r4/wd" && printf '1\n' > "$r4/wd/f" && (cd "$r4/wd" && $GIT add -A && $GIT commit -q -m One && $GIT branch side && $GIT worktree add -q ../wt side) 2> /dev/null
+mg clone "$r4/wd" "$r4/wc" > /dev/null 2>&1 && (cd "$r4/wc" && mg checkout side > /dev/null 2>&1 && printf '2\n' > f && mg commit -q -m Two)
+before=$($GIT -C "$r4/wd" rev-parse side)
+out=$(in_mg "$r4/wc" push "$r4/wd" side 2>&1)
+same "push to a path: a branch checked out in a linked worktree there is refused" "128 1 $before" "$? $(printf '%s\n' "$out" | grep -c 'checked out there') $($GIT -C "$r4/wd" rev-parse side)"
+# F16 (Fable): a tag of 0 bytes is refused as a tag, not read through a null buffer (a packed one inflates to none)
+$GIT init -q -b main "$r4/et"
+# the entry: a tag of 0 bytes, deflated as zlib deflates nothing (one fixed block holding only its end code)
+{ printf 'PACK'; hexb "$(be32 2)$(be32 1)"; hexb 40789c030000000001; } > "$r4/et/body"
+{ cat "$r4/et/body"; hexb "$(sha1sum "$r4/et/body" | cut -c1-40)"; } > "$r4/et/e.pack"
+(cd "$r4/et" && $GIT index-pack -o .git/objects/pack/pack-e.idx e.pack > /dev/null && mv e.pack .git/objects/pack/pack-e.pack)
+printf '%s\n' "$(printf 'tag 0\000' | sha1sum | cut -c1-40)" > "$r4/et/.git/refs/tags/t"
+out=$(in_mg "$r4/et" rev-parse 't^0' 2>&1)
+same "rev-parse: a packed tag of 0 bytes is refused, not read through a null pointer" "128 1" "$? $(printf '%s\n' "$out" | grep -c 'is a tag, not a commit')"
+
+# ---- 6.1.5 ----
+# 38. what the second reviews (of 6.1.4) found: claims.tsv beside the 6.1.5 work has each input and its 6.1.4 result
+r5=$tmp/v615
+mkdir -p "$r5"
+$GIT init -q -b main "$r5/src" && printf 'x\n' > "$r5/src/x" && $GIT -C "$r5/src" add -A && $GIT -C "$r5/src" commit -q -m Start
+echo main | $GIT -C "$r5/src" pack-objects -q --revs --stdout > "$r5/main.pack"
+{ printf 0000 | /usr/bin/git-upload-pack "$r5/src"; printf '0008NAK\n'; sb4 "$r5/main.pack"; } > "$fb/canned"
+for d in c s z; do mg clone canned:x "$r5/$d" > /dev/null 2>&1 || bad "6.1.5 canned clone $d"; done	# s and z: the signal and 040000 rows' own
+(cd "$r5/src" && printf '2\n' > x && $GIT commit -q -a -m Two)
+c2=$($GIT -C "$r5/src" rev-parse main) t2=$($GIT -C "$r5/src" rev-parse main^{tree})
+canned5() {	# the source's advert (main at c2), one round of haves and done, then PACK
+	{ printf 0000 | /usr/bin/git-upload-pack "$r5/src"; printf '0008NAK\n0008NAK\n'; sb4 "$1"; } > "$fb/canned"
+}
+# N1: the far side sends back the pack this repository holds; the failed fetch must leave that pack as it was
+canned5 "$r5/main.pack"
+packs=$(ls "$r5/c/.git/objects/pack" | tr '\n' ' ')
+(cd "$r5/c" && mg fetch > /dev/null 2>&1)
+same "fetch: a far side replaying the pack held here, with a tip that is not, leaves that pack and git fsck clean" "128 $packs clean" \
+	"$? $(ls "$r5/c/.git/objects/pack" | tr '\n' ' ') $($GIT -C "$r5/c" fsck > /dev/null 2>&1 && echo clean)"
+# M05 (signal): a fetch interrupted in its connectivity check (held there by a FIFO at the tree's loose path, which
+# is read first) removes the pack it received, as an exit does
+printf '%s\n%s\n' "$c2" "$t2" | $GIT -C "$r5/src" pack-objects -q --stdout > "$r5/noblob.pack"
+canned5 "$r5/noblob.pack"
+fifo=$r5/s/.git/objects/$(echo "$t2" | cut -c1-2)/$(echo "$t2" | cut -c3-)
+mkdir -p "${fifo%/*}" && mkfifo "$fifo"
+n=$(ls "$r5/s/.git/objects/pack" | wc -l)
+(cd "$r5/s" && exec "$MGIT" fetch) > /dev/null 2>&1 &
+pid=$!
+i=0; while [ $i -lt 100 ] && [ "$(ls "$r5/s/.git/objects/pack" | grep -c '^pack-')" -le "$n" ]; do sleep 0.1; i=$((i + 1)); done
+sleep 0.3
+kill -TERM $pid 2>/dev/null; wait $pid
+rm -f "$fifo"
+same "fetch: SIGTERM inside the connectivity check removes the pack that came" "$n" "$(ls "$r5/s/.git/objects/pack" | wc -l)"
+# M01: a HEAD symref that names no branch is passed over; the clone takes main at HEAD's id
+x5=$($GIT -C "$r5/src" rev-parse main~1)
+l1="$x5 HEAD" caps='multi_ack_detailed side-band-64k ofs-delta symref=HEAD:HEAD agent=git/test' l2="$x5 refs/heads/main"
+{ printf '%04x%s\000%s\n' $((${#l1} + ${#caps} + 6)) "$l1" "$caps"; printf '%04x%s\n0000' $((${#l2} + 5)) "$l2"; printf '0008NAK\n'; sb4 "$r5/main.pack"; } > "$fb/canned"
+mg clone canned:x "$r5/hh" > /dev/null 2>&1
+same "clone: symref=HEAD:HEAD leaves HEAD on main, checked out" "0 refs/heads/main $x5" "$? $($GIT -C "$r5/hh" symbolic-ref HEAD 2>&1) $(in_mg "$r5/hh" rev-parse HEAD 2>&1)"
+l1="0000000000000000000000000000000000000000 capabilities^{}" caps='report-status symref=HEAD:config agent=git/test'
+printf '%04x%s\000%s\n0000' $((${#l1} + ${#caps} + 6)) "$l1" "$caps" > "$fb/canned"
+mg clone canned:x "$r5/hc" > /dev/null 2>&1
+same "clone: an empty repository whose symref is HEAD:config leaves HEAD on main" "0 refs/heads/main" "$? $($GIT -C "$r5/hc" symbolic-ref HEAD 2>&1)"
+# M08: checkout refuses the names commit leaves out; commit also leaves out .git:x, a\.git and a .gitmodules symlink
+$GIT init -q -b main "$r5/dg"
+bc=$(printf '[core]\n' | in_git "$r5/dg" hash-object -w --stdin)
+st=$({ printf '100644 config\000'; hexb "$bc"; } | in_git "$r5/dg" hash-object -t tree -w --literally --stdin)
+rt=$({ printf '40000 git~1\000'; hexb "$st"; } | in_git "$r5/dg" hash-object -t tree -w --literally --stdin)
+in_git "$r5/dg" update-ref refs/heads/main "$(in_git "$r5/dg" commit-tree -m 'git~1' "$rt")"
+out=$(cd "$r5" && mg clone "$r5/dg" dgc 2>&1)
+same "clone: a tree entry named git~1 is refused, as git clone refuses it, leaving nothing" "128 1 absent" \
+	"$? $(printf '%s\n' "$out" | grep -c 'unsafe path: git~1') $([ -e "$r5/dgc" ] && echo present || echo absent)"
+mg init "$r5/dn" > /dev/null && printf 'k\n' > "$r5/dn/keep"
+mkdir "$r5/dn/.git:x" && printf 'f\n' > "$r5/dn/.git:x/f" && printf 'f\n' > "$r5/dn/a\\.git" && ln -s keep "$r5/dn/.gitmodules"
+out=$(in_mg "$r5/dn" commit -q -m Start 2>&1)
+same "commit: .git:x, a\\.git and a .gitmodules symlink are left out, each with a warning" "keep 3" \
+	"$(in_git "$r5/dn" ls-tree --name-only HEAD | tr '\n' ' ' | sed 's/ $//') $(printf '%s\n' "$out" | grep -c 'git refuses that name')"
+# M14: control bytes from elsewhere shown as ^X: a push's ng reason, a clone's notice, check's FAIL line
+mg init "$r5/pw" > /dev/null && printf 'x\n' > "$r5/pw/x" && in_mg "$r5/pw" commit -q -m Start
+l1="0000000000000000000000000000000000000000 capabilities^{}" caps='report-status side-band-64k agent=git/test'
+rep=$(printf '000eunpack ok\n'; ng=$(printf 'ng refs/heads/main \033[2Jno\n'); printf '%04x%s' $((${#ng} + 4)) "$ng"; printf 0000)
+{ printf '%04x%s\000%s\n0000' $((${#l1} + ${#caps} + 6)) "$l1" "$caps"; printf '%04x\001%s0000' $((${#rep} + 5)) "$rep"; } > "$fb/canned"
+in_mg "$r5/pw" push canned:x main > "$r5/pw.out" 2>&1
+$GIT init -q -b main "$r5/ga" && printf '* filter=\033[2J\n' > "$r5/ga/.gitattributes" && in_git "$r5/ga" add -A && in_git "$r5/ga" commit -q -m Start
+mg clone "$r5/ga" "$r5/gac" > "$r5/ga.out" 2>&1
+$GIT init -q -b main "$r5/cp" && printf 'key AKIA%s\n' ABCDEFGHIJKLMNOP > "$r5/cp/$(printf 'n\033[2J.txt')" && in_git "$r5/cp" add -A && in_git "$r5/cp" commit -q -m Start
+in_mg "$r5/cp" check > "$r5/cp.out" 2>&1
+same "push report, clone notice and check FAIL line show ESC as ^[, with no raw ESC" "0 1 1 1" \
+	"$(cat "$r5/pw.out" "$r5/ga.out" "$r5/cp.out" | tr -cd '\033' | wc -c) $(grep -c 'main (^\[\[2Jno)' "$r5/pw.out") $(grep -c 'filter=^\[\[2J' "$r5/ga.out") $(grep -c 'n^\[\[2J.txt:1:' "$r5/cp.out")"
+# M10: fetch refuses a branch checked out in a linked worktree, as git does
+$GIT clone -q "$r5/src" "$r5/lw" 2>/dev/null
+(cd "$r5/lw" && $GIT branch -q side main~1 && $GIT worktree add -q ../lw-wt side) 2>/dev/null
+$GIT -C "$r5/lw" config --replace-all remote.origin.fetch '+refs/heads/*:refs/heads/*'
+(cd "$r5/src" && $GIT branch -q -f side main)
+before=$($GIT -C "$r5/lw" rev-parse side)
+(cd "$r5/lw" && mg fetch > /dev/null 2>&1)
+same "fetch: a branch checked out in a linked worktree is not moved" "1 $before" "$? $($GIT -C "$r5/lw" rev-parse side)"
+# M18: a 23-digit time stamp is shown as git shows it, not read past an overflow
+t5=$(in_git "$r5/src" rev-parse main^{tree})
+co=$(printf 'tree %s\nauthor A <a@example.com> 99999999999999999999999 +0100\ncommitter A <a@example.com> 99999999999999999999999 +0100\n\nLong\n' "$t5" |
+	in_git "$r5/src" hash-object -t commit -w --literally --stdin)
+same "log: a 23-digit time stamp shows as git shows it" "$(in_git "$r5/src" log -1 --format=%ad "$co")" "$(in_mg "$r5/src" log -1 --format=%ad "$co" 2>&1)"
+# N7: a zero-padded 040000 subtree is a tree to the connectivity walk and to check, as to git and checkout
+bz=$(printf 'key AKIA%s\n' ABCDEFGHIJKLMNOP | in_git "$r5/src" hash-object -w --stdin)
+tz=$({ printf '100644 f\000'; hexb "$bz"; } | in_git "$r5/src" hash-object -t tree -w --literally --stdin)
+rz=$({ printf '040000 d\000'; hexb "$tz"; } | in_git "$r5/src" hash-object -t tree -w --literally --stdin)
+cz=$(in_git "$r5/src" commit-tree -m 'Zero-padded subtree' "$rz")
+in_git "$r5/src" update-ref refs/heads/main "$cz"
+$GIT -C "$r5/src" branch -q -D side	# the M10 row's branch: only main is to be fetched here
+printf '%s\n%s\n%s\n' "$cz" "$rz" "$tz" | $GIT -C "$r5/src" pack-objects -q --stdout > "$r5/zp.pack"
+canned5 "$r5/zp.pack"
+$GIT -C "$r5/z" config remote.origin.url canned:x
+out=$(cd "$r5/z" && mg fetch 2>&1)
+same "fetch: a 040000 subtree without its blob is refused, and no ref moves" "128 1" \
+	"$? $(printf '%s\n' "$out" | grep -c "lacks object $bz")"
+$GIT clone -q --no-checkout "$r5/src" "$r5/zc" 2>/dev/null
+out=$(in_mg "$r5/zc" check 2>&1)
+same "check: a secret in a 040000 subtree is found" "1 1" "$? $(printf '%s\n' "$out" | grep -c 'FAIL secret.*d/f:1:')"
+# N10 (M21): a stream may not reach back past its own start into bytes the buffer held before it
+cat > "$tmp/z5.c" <<'EOF'
+#include "mgit.h"
+#include <stdio.h>
+
+int main(void)
+{
+	static const unsigned char z[] = { 0x78, 0x01, 0x03, 0x02, 0x00, 0x02, 0x55, 0x01, 0x2a };	/* length 3, distance 1; adler32 of "ccc" */
+	buf out = { 0 };
+	size_t used;
+
+	buf_adds(&out, "abc");
+	printf("%d %zu\n", zlib_inflate_prefix(&out, z, sizeof z, SIZE_MAX, &used), out.len);
+	return 0;
+}
+EOF
+set --
+for s in "$here"/src/*.c; do
+	case $s in */main.c) ;; *) set -- "$@" "$s" ;; esac
+done
+if cc -std=c23 -O2 -ffp-contract=off -I"$here/src" -o "$tmp/z5" "$tmp/z5.c" "$tmp/f1-main.o" "$@" 2>/dev/null; then
+	same "inflate: a back-reference past the stream's own start is refused (zlib: invalid distance too far back)" "-1 3" "$("$tmp/z5")"
+else
+	bad "the inflate driver did not compile"
+fi
 printf 'pass %d  fail %d\n' "$pass" "$fail"
 exit $((fail > 0))

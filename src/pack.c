@@ -265,8 +265,6 @@ static int apply_delta(const buf *base, const buf *delta, buf *out)
 	return out->len == dst ? 0 : -1;
 }
 
-static int unpack(const struct pack *p, uint64_t off, int *type, buf *out, int depth);
-
 /*
  * A pack being indexed (pack_index) has no idx yet: its REF_DELTA bases are found among its own entries whose ids are
  * known so far, sorted by id in ix.by_id.
@@ -315,106 +313,166 @@ static int inflate_entry(const struct pack *p, const unsigned char *q, uint64_t 
 	size_t used;
 
 	out->len = 0;
-	return zlib_inflate_prefix(out, q, (size_t)(p->data + p->data_len - 20 - q), &used) || out->len != size ? -1 : 0;
+	return zlib_inflate_prefix(out, q, (size_t)(p->data + p->data_len - 20 - q), (size_t)size, &used) ||
+	       out->len != size ? -1 : 0;
 }
 
-static int unpack(const struct pack *p, uint64_t off, int *type, buf *out, int depth)
+/* The pack that holds id, first in the list, and where; NULL when none does. */
+static const struct pack *pack_find(const unsigned char id[20], uint64_t *off)
 {
-	const unsigned char *q, *end = p->data + p->data_len - 20;
-	uint64_t size;
-	unsigned char c;
-	int t, shift = 4, r = -1;
-	buf delta = { 0 }, base = { 0 };
+	struct repo_packs *r = packs();
+	size_t i;
 
-	if (depth > 10000 || off < 12 || off >= p->data_len - 20)
-		return -1;
-	q = p->data + off;
-	c = *q++;
-	t = (c >> 4) & 7;
-	size = c & 15;
-	while (c & 0x80) {
-		if (q >= end || shift > 57)
-			return -1;
-		c = *q++;
-		size |= (uint64_t)(c & 0x7f) << shift;
-		shift += 7;
-	}
-	if (t >= OBJ_COMMIT && t <= OBJ_TAG) {
-		*type = t;
-		return inflate_entry(p, q, size, out);
-	}
-	if (t == 6) {
-		/* OFS_DELTA: base offset backwards, base-128 with an extra 1 added per continuation byte */
-		uint64_t back;
+	for (i = 0; i < r->n; i++)
+		if (find(&r->v[i], id, off))
+			return &r->v[i];
+	return NULL;
+}
 
-		if (q >= end)
-			return -1;
-		c = *q++;
-		back = c & 0x7f;
-		while (c & 0x80) {
-			if (q >= end || back >= (UINT64_MAX >> 8))
-				return -1;
-			c = *q++;
-			back = ((back + 1) << 7) | (c & 0x7f);
-		}
-		if (!back || back > off)
-			return -1;
-		if (!cache_get(p, off - back, type, &base)) {
-			if (unpack(p, off - back, type, &base, depth + 1))
-				goto out;
-			cache_put(p, off - back, *type, &base);
-		}
-	} else if (t == 7) {
-		/* REF_DELTA: base named by id, possibly loose or in another pack */
-		unsigned char id[20];
+/* Git writes chains of at most 4095 deltas. A longer one is refused, and so ends a cycle of REF_DELTAs naming each other. */
+#define CHAIN_MAX 10000
 
-		if (end - q < 20)
-			return -1;
-		memcpy(id, q, 20);
-		q += 20;
-		if (p == ix.p) {
-			uint64_t boff;
+/* A delta met on the way down its chain, applied on the way back up. */
+struct link {
+	const struct pack *p;
+	const unsigned char *q;		/* its instructions, deflated */
+	uint64_t size;			/* their inflated size */
+	uint64_t base_off;		/* its base, when that is in p at a known offset */
+	unsigned char id[20];		/* its base, when named by id through the object store */
+	int by_id;
+};
 
-			if (!ix_find(id, &boff))
-				goto out;
-			if (!cache_get(p, boff, type, &base)) {
-				if (unpack(p, boff, type, &base, depth + 1))
-					goto out;
-				cache_put(p, boff, *type, &base);
-			}
-		} else if (object_read(id, type, &base)) {
+/*
+ * Rebuilds the object at off in a loop, so a chain costs heap and never stack, however it runs: OFS_DELTA, REF_DELTA,
+ * from pack to pack. A base named by id is found as object_read finds it, loose first, and is held to its id.
+ */
+static int unpack(const struct pack *p, uint64_t off, int *type, buf *out)
+{
+	struct link *v = NULL;
+	size_t n = 0, cap = 0;
+	buf delta = { 0 }, next = { 0 };
+	int r = -1, checked = 0;	/* checked: what out holds came from the cache or a loose object */
+
+	for (;;) {
+		const unsigned char *q, *end = p->data + p->data_len - 20;
+		struct link *l;
+		uint64_t size;
+		unsigned char c;
+		int t, shift = 4;
+
+		if (off < 12 || off >= p->data_len - 20)
 			goto out;
+		q = p->data + off;
+		c = *q++;
+		t = (c >> 4) & 7;
+		size = c & 15;
+		while (c & 0x80) {
+			if (q >= end || shift > 57)
+				goto out;
+			c = *q++;
+			size |= (uint64_t)(c & 0x7f) << shift;
+			shift += 7;
 		}
-	} else {
-		return -1;
+		if (t >= OBJ_COMMIT && t <= OBJ_TAG) {
+			*type = t;
+			if (inflate_entry(p, q, size, out))
+				goto out;
+			break;
+		}
+		if ((t != 6 && t != 7) || n == CHAIN_MAX)
+			goto out;
+		if (n == cap) {
+			cap = cap ? 2 * cap : 16;
+			v = xrealloc(v, cap * sizeof *v);
+		}
+		l = &v[n++];
+		l->p = p;
+		l->size = size;
+		l->by_id = 0;
+		if (t == 6) {
+			/* OFS_DELTA: base offset backwards, base-128 with an extra 1 added per continuation byte */
+			uint64_t back;
+
+			if (q >= end)
+				goto out;
+			c = *q++;
+			back = c & 0x7f;
+			while (c & 0x80) {
+				if (q >= end || back >= (UINT64_MAX >> 8))
+					goto out;
+				c = *q++;
+				back = ((back + 1) << 7) | (c & 0x7f);
+			}
+			if (!back || back > off)
+				goto out;
+			off -= back;
+		} else {
+			/* REF_DELTA: base named by id, possibly loose or in another pack */
+			if (end - q < 20)
+				goto out;
+			memcpy(l->id, q, 20);
+			q += 20;
+			if (p == ix.p) {
+				if (!ix_find(l->id, &off))
+					goto out;
+			} else {
+				l->by_id = 1;
+				l->q = q;
+				if (!loose_read(l->id, type, out)) {
+					checked = 1;
+					break;
+				}
+				if (!(p = pack_find(l->id, &off)))
+					goto out;
+				continue;
+			}
+		}
+		l->q = q;
+		l->base_off = off;
+		if (cache_get(p, off, type, out)) {
+			checked = 1;
+			break;
+		}
 	}
-	if (!inflate_entry(p, q, size, &delta) && !apply_delta(&base, &delta, out))
-		r = 0;
+	for (; n; n--) {
+		const struct link *l = &v[n - 1];
+		buf t;
+
+		if (!checked) {
+			if (l->by_id)
+				object_check(l->id, *type, out);
+			else
+				cache_put(l->p, l->base_off, *type, out);
+		}
+		checked = 0;
+		if (inflate_entry(l->p, l->q, l->size, &delta) || apply_delta(out, &delta, &next))
+			goto out;
+		t = *out;
+		*out = next;
+		next = t;
+	}
+	r = 0;
 out:
+	free(v);
 	buf_free(&delta);
-	buf_free(&base);
+	buf_free(&next);
 	return r;
 }
 
 /* -1 when no pack holds id; dies when one does but the entry cannot be rebuilt. */
 int pack_read(const unsigned char id[20], int *type, buf *out)
 {
-	struct repo_packs *r = packs();
-	size_t i;
+	uint64_t off;
+	const struct pack *p = pack_find(id, &off);
+	char hex[41];
 
-	for (i = 0; i < r->n; i++) {
-		uint64_t off;
-
-		if (find(&r->v[i], id, &off)) {
-			char hex[41];
-
-			id_to_hex(id, hex);
-			if (unpack(&r->v[i], off, type, out, 0))
-				die("corrupt object %s in %s", hex, r->v[i].name);
-			return 0;
-		}
+	if (!p)
+		return -1;
+	if (unpack(p, off, type, out)) {
+		id_to_hex(id, hex);
+		die("corrupt object %s in %s", hex, p->name);
 	}
-	return -1;
+	return 0;
 }
 
 int pack_has(const unsigned char id[20])
@@ -518,7 +576,7 @@ int pack_verify(const char *idx_path, const struct objlist *want)
 		char hex[41];
 
 		id_to_hex(want->v[i].id, hex);
-		if (!find(p, want->v[i].id, &off) || unpack(p, off, &type, &b, 0)) {
+		if (!find(p, want->v[i].id, &off) || unpack(p, off, &type, &b)) {
 			warning("%s: object %s is missing or unreadable", idx_path, hex);
 			return -1;
 		}
@@ -627,10 +685,11 @@ void pack_unmap_all(void)
  * its stated size, every delta rebuilt from a base in the same pack (OFS_DELTA by offset, REF_DELTA by id; a thin
  * pack is refused), every object hashed. Then its idx v2, both renamed to pack-<sum>, the pair read back through the
  * idx (pack_verify) and the pack added to this repository's list. out receives every object in the pack. Dies,
- * removing the files, on anything wrong.
+ * removing the files, on anything wrong. Returns the kept pack's path (NULL for an empty pack, which is removed).
  */
-void pack_index(const char *tmp, struct objlist *out)
+char *pack_index(const char *tmp, struct objlist *out)
 {
+	char *kept = NULL;
 	struct pack p = { 0 };
 	struct entry *v;
 	struct repo_packs *r;
@@ -712,7 +771,7 @@ void pack_index(const char *tmp, struct objlist *out)
 			index_fail(tmp, NULL, "an entry has an unknown type");
 		}
 		z.len = 0;
-		if (zlib_inflate_prefix(&z, q, (size_t)(end - q), &used) || z.len != size)
+		if (zlib_inflate_prefix(&z, q, (size_t)(end - q), (size_t)size, &used) || z.len != size)
 			index_fail(tmp, NULL, "an entry does not inflate to its stated size");
 		v[i].end = (uint64_t)(q - p.data) + used;
 		v[i].crc = crc32_update(0, p.data + off, (size_t)(v[i].end - off));
@@ -741,7 +800,7 @@ void pack_index(const char *tmp, struct objlist *out)
 
 			if (v[i].type)
 				continue;
-			if (unpack(&p, v[i].off, &type, &z, 0)) {
+			if (unpack(&p, v[i].off, &type, &z)) {
 				left++;
 				continue;
 			}
@@ -776,6 +835,28 @@ void pack_index(const char *tmp, struct objlist *out)
 		index_fail(tmp, tidx, "the idx could not be written");
 	id_to_hex(p.data + p.data_len - 20, hex);
 	buf_printf(&name, "%s/pack-%s.pack", dir, hex);
+	{
+		buf in = { 0 };
+		int here;
+
+		buf_printf(&in, "%s/pack-%s.idx", dir, hex);
+		here = !access((char *)name.p, F_OK) && !access((char *)in.p, F_OK);
+		if (!here) {
+			/* until the caller knows what it brings connects, a signal removes the pair too */
+			remove_if_killed(DOOM_PACK, (char *)name.p);
+			remove_if_killed(DOOM_IDX, (char *)in.p);
+		}
+		buf_free(&in);
+		if (here) {
+			/* this very pack is here already (a pack is named by its checksum): that one stays as it is */
+			unlink(tidx);
+			unlink(tmp);
+			free(offs);
+			free(crcs);
+			free(tidx);
+			goto out;
+		}
+	}
 	if (rename(tmp, (char *)name.p))
 		index_fail(tmp, tidx, "the pack could not be renamed");
 	name.len -= 5;
@@ -799,6 +880,7 @@ void pack_index(const char *tmp, struct objlist *out)
 		}
 		if (idx_readback((char *)name.p, out, offs))
 			index_fail((char *)pk.p, (char *)name.p, "it does not read back through its idx");
+		kept = xstrdup((char *)pk.p);
 		buf_free(&pk);
 		buf_free(&in);
 	}
@@ -816,4 +898,5 @@ out:
 	buf_free(&z);
 	buf_free(&idx);
 	buf_free(&name);
+	return kept;
 }

@@ -6,8 +6,8 @@
 #include <string.h>
 #include <strings.h>
 
-/* Next "<mode> <name>\0<20-byte id>" entry of a tree object, or 0 at the end. */
-static int tree_next(const unsigned char **pp, const unsigned char *end, unsigned *mode, const char **name,
+/* Next "<mode> <name>\0<20-byte id>" entry of a tree object (the mode read in octal, as git reads it), or 0 at the end. */
+int tree_next(const unsigned char **pp, const unsigned char *end, unsigned *mode, const char **name,
 		     const unsigned char **id)
 {
 	const unsigned char *p = *pp, *sp, *nul, *q;
@@ -66,7 +66,38 @@ void tree_build(const struct files *f, unsigned char id[20])
 	build(f, 0, f->n, 0, id);
 }
 
-static void flatten(const unsigned char id[20], const char *prefix, struct files *out)
+/* .git or git~1 in any case, then only dots and spaces up to the end, a ':' or a '\': git's is_ntfs_dotgit. */
+static int dotgit_at(const char *p)
+{
+	if (p[0] == '.' && !strncasecmp(p + 1, "git", 3))
+		p += 4;
+	else if (!strncasecmp(p, "git~1", 5))
+		p += 5;
+	else
+		return 0;
+	p += strspn(p, ". ");
+	return !*p || *p == ':' || *p == '\\';
+}
+
+/*
+ * Whether git refuses name as a path component of an entry with this mode (verify_path, with core.protectNTFS on as by
+ * default): a .git as NTFS reads one, at the start or after any '\', and a symlink named .gitmodules.
+ */
+int name_refused(const char *name, unsigned mode)
+{
+	const char *p = name;
+
+	for (;;) {
+		if (dotgit_at(p))
+			return 1;
+		if (!(p = strchr(p, '\\')))
+			break;
+		p++;
+	}
+	return mode == 0120000 && !strncasecmp(name, ".gitmodules", 11) && !name[11 + strspn(name + 11, ". ")];
+}
+
+static void flatten(const unsigned char id[20], const char *prefix, struct files *out, int depth)
 {
 	const unsigned char *p, *end, *eid;
 	const char *name;
@@ -74,20 +105,22 @@ static void flatten(const unsigned char id[20], const char *prefix, struct files
 	buf b = { 0 }, path = { 0 };
 	int type;
 
+	if (depth > TREE_DEPTH_MAX)
+		die("trees are nested more than %d deep", TREE_DEPTH_MAX);
 	object_read_or_die(id, &type, &b);
 	if (type != OBJ_TREE)
 		die("expected a tree, found a %s", type_name(type));
 	p = b.p;
 	end = b.p + b.len;
 	while (tree_next(&p, end, &mode, &name, &eid)) {
-		if (!strcmp(name, ".") || !strcmp(name, "..") || !strcasecmp(name, ".git") || strchr(name, '/'))
+		if (!strcmp(name, ".") || !strcmp(name, "..") || name_refused(name, mode) || strchr(name, '/'))
 			die("tree contains an unsafe path: %s%s", prefix, name);
 		path.len = 0;
 		buf_adds(&path, prefix);
 		buf_adds(&path, name);
 		if (mode == 040000) {
 			buf_addc(&path, '/');
-			flatten(eid, (char *)path.p, out);
+			flatten(eid, (char *)path.p, out, depth + 1);
 		} else if (mode == 0160000) {
 			files_add(out, (char *)path.p, mode, eid); /* a submodule's commit: kept as it is, never fetched */
 		} else if ((mode & 0170000) == 0100000) {
@@ -104,7 +137,7 @@ static void flatten(const unsigned char id[20], const char *prefix, struct files
 
 void tree_flatten(const unsigned char tree[20], struct files *out)
 {
-	flatten(tree, "", out);
+	flatten(tree, "", out, 0);
 	files_sort(out);
 }
 

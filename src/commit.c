@@ -6,11 +6,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 void commit_parse(const buf *b, struct commit *c)
 {
 	const char *p = (const char *)b->p, *end = p + b->len;
-	int have_tree = 0;
+	int have_tree = 0, line = 0, parents = 1;
 
 	memset(c, 0, sizeof *c);
 	while (p < end) {
@@ -25,13 +26,19 @@ void commit_parse(const buf *b, struct commit *c)
 			c->msg_len = (size_t)(end - c->msg);
 			break;
 		}
-		if (len == 45 && !memcmp(p, "tree ", 5) && !hex_to_id(p + 5, c->tree)) {
+		/* as git reads a commit: the tree on the first line only, the parents only on the lines right after it */
+		if (!line++) {
+			if (len != 45 || memcmp(p, "tree ", 5) || hex_to_id(p + 5, c->tree))
+				break;
 			have_tree = 1;
-		} else if (len == 47 && !memcmp(p, "parent ", 7)) {
+		} else if (parents && len == 47 && !memcmp(p, "parent ", 7)) {
 			c->parent = xrealloc(c->parent, (size_t)(c->nparent + 1) * sizeof *c->parent);
 			if (hex_to_id(p + 7, c->parent[c->nparent++]))
 				die("corrupt commit: bad parent line");
-		} else if (len > 7 && !memcmp(p, "author ", 7)) {
+		} else {
+			parents = 0;
+		}
+		if (len > 7 && !memcmp(p, "author ", 7)) {
 			c->author = p + 7;
 			c->author_len = len - 7;
 		} else if (len > 10 && !memcmp(p, "committer ", 10)) {
@@ -290,6 +297,14 @@ int cmd_commit(int argc, char **argv)
 	}
 
 	repo_find();
+	for (k = 0; k < 5; k++) {
+		static const char *const busy[] = { "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply" };
+		char *f = path_join(git_dir, busy[k]);
+
+		if (!access(f, F_OK))
+			die("%s exists: git is in the middle of a merge, cherry-pick, revert or rebase; finish it with git", f);
+		free(f);
+	}
 	ident(&who, "author", "author", author);
 	ident(&who, "committer", "committer", NULL);
 	state_load(&s);

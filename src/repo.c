@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <signal.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -284,17 +285,84 @@ char **config_subsections(const char *section, size_t *count)
 	return s.v;
 }
 
+/* What SIGINT, SIGTERM or SIGHUP removes before the process ends (DOOM_LOCK, DOOM_PACK, DOOM_IDX in mgit.h). */
+static char doomed[3][PATH_MAX];
+
+static void doomed_signal(int sig)
+{
+	size_t i;
+
+	for (i = 0; i < 3; i++)
+		if (doomed[i][0])
+			unlink(doomed[i]);
+	signal(sig, SIG_DFL);
+	raise(sig);
+}
+
+/* Sets what slot names for removal on a signal (path NULL clears it). */
+void remove_if_killed(int slot, const char *path)
+{
+	static const int sigs[] = { SIGINT, SIGTERM, SIGHUP };
+	static int armed;
+	size_t i;
+
+	if (!armed) {
+		for (i = 0; i < sizeof sigs / sizeof *sigs; i++) {
+			struct sigaction old;
+
+			if (!sigaction(sigs[i], NULL, &old) && old.sa_handler != SIG_IGN)
+				signal(sigs[i], doomed_signal);
+		}
+		armed = 1;
+	}
+	if (path && strlen(path) < sizeof doomed[slot])
+		strcpy(doomed[slot], path);
+	else
+		doomed[slot][0] = 0;
+}
+
+/* Removes the lock this process holds, if any. */
+void lock_drop(void)
+{
+	if (doomed[DOOM_LOCK][0])
+		unlink(doomed[DOOM_LOCK]);
+	doomed[DOOM_LOCK][0] = 0;
+}
+
+/* Creates path as a lock file (O_EXCL), held until lock_done: an exit, a die, or SIGINT, SIGTERM or SIGHUP before then removes it, as git does its lock files. */
+int lock_take(const char *path)
+{
+	static int armed;
+	int fd;
+
+	if (!armed) {
+		atexit(lock_drop);
+		armed = 1;
+	}
+	remove_if_killed(DOOM_LOCK, NULL);
+	fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0666);
+	if (fd >= 0)
+		remove_if_killed(DOOM_LOCK, path);
+	return fd;
+}
+
+/* The lock was renamed into place: no longer this process's to remove. */
+void lock_done(void)
+{
+	doomed[DOOM_LOCK][0] = 0;
+}
+
 /* Appends text to the repository's config, through config.lock as git does. */
 void config_append(const char *text)
 {
 	char *path = path_join(git_dir, "config"), *lock = path_join(git_dir, "config.lock");
 	buf b = { 0 };
-	int fd = open(lock, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0666);
+	int fd = lock_take(lock);
 
 	if (fd < 0)
 		die("cannot lock %s: %s", path, strerror(errno));
 	if (read_file(path, &b) && errno != ENOENT) {
-		unlink(lock);
+		lock_drop();
 		die("cannot read %s: %s", path, strerror(errno));
 	}
 	if (b.len && b.p[b.len - 1] != '\n')
@@ -303,6 +371,7 @@ void config_append(const char *text)
 	write_all(fd, b.p, b.len, lock);
 	if (fsync(fd) || close(fd) || rename(lock, path))
 		die("cannot write %s: %s", path, strerror(errno));
+	lock_done();
 	buf_free(&b);
 	free(lock);
 	free(path);
@@ -429,7 +498,7 @@ void symref_set(const char *name, const char *target)
 			die("cannot create %s: %s", path, strerror(errno));
 		*p = '/';
 	}
-	fd = open(lock, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0666);
+	fd = lock_take(lock);
 	if (fd < 0)
 		die("cannot create %s: %s", lock, strerror(errno));
 	write_all(fd, "ref: ", 5, lock);
@@ -437,6 +506,7 @@ void symref_set(const char *name, const char *target)
 	write_all(fd, "\n", 1, lock);
 	if (fsync(fd) || close(fd) || rename(lock, path))
 		die("cannot update %s: %s", name, strerror(errno));
+	lock_done();
 	free(lock);
 	free(path);
 }
@@ -461,14 +531,14 @@ void ref_update(const char *name, const unsigned char new_id[20], const unsigned
 			die("cannot create %s: %s", path, strerror(errno));
 		*p = '/';
 	}
-	fd = open(lock, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0666);
+	fd = lock_take(lock);
 	if (fd < 0 && errno == EEXIST)
 		die("%s exists: another process is updating %s, or the lock is stale", lock, name);
 	if (fd < 0)
 		die("cannot create %s: %s", lock, strerror(errno));
 	have = ref_read(name, cur) == 0;
 	if (old_id ? !have || memcmp(cur, old_id, 20) : have) {
-		unlink(lock);
+		lock_drop();
 		if (old_id)
 			die("%s moved while this command ran; nothing updated", name);
 		die("%s already exists", name);
@@ -480,6 +550,7 @@ void ref_update(const char *name, const unsigned char new_id[20], const unsigned
 		die("cannot write %s: %s", lock, strerror(errno));
 	if (rename(lock, path))
 		die("cannot rename %s: %s", lock, strerror(errno));
+	lock_done();
 	free(lock);
 	free(path);
 }
@@ -542,7 +613,7 @@ void peel_to_commit(unsigned char id[20])
 			buf_free(&b);
 			return;
 		}
-		if (type != OBJ_TAG || strncmp((char *)b.p, "object ", 7) || hex_to_id((char *)b.p + 7, id))
+		if (type != OBJ_TAG || b.len < 47 || strncmp((char *)b.p, "object ", 7) || hex_to_id((char *)b.p + 7, id))
 			die("%s is a %s, not a commit", hex, type_name(type));
 		buf_free(&b);
 	}

@@ -85,7 +85,11 @@ static int allowed(const struct ck *ck, const char *text)
 
 static void emit(struct ck *ck, int fail, const char *rule, const char *text)
 {
-	printf("%s %-11s %s\n", fail ? "FAIL" : "WARN", rule, text);
+	buf t = { 0 };
+
+	buf_add_masked(&t, text);	/* paths and idents come from fetched objects too */
+	printf("%s %-11s %s\n", fail ? "FAIL" : "WARN", rule, (char *)t.p);
+	buf_free(&t);
 	if (fail)
 		ck->fail++;
 	else
@@ -462,15 +466,19 @@ static const char *body(const buf *b, size_t *len)
 /* ---- trees: paths, the ignore rules ---- */
 
 static void check_tree(struct ck *ck, const unsigned char tree[20], const char *prefix, int ign_dir, const unsigned char ctx[20],
-		       const char *commit)
+		       const char *commit, int depth)
 {
 	unsigned char key[20], sub_ctx[20];
-	const unsigned char *p, *end;
+	const unsigned char *p, *end, *eid;
+	const char *name;
 	buf b = { 0 }, path = { 0 };
 	size_t mark = ck->ig.n;
+	unsigned mode;
 	sha1_ctx c;
 	int type;
 
+	if (depth > TREE_DEPTH_MAX)
+		die("trees are nested more than %d deep", TREE_DEPTH_MAX);
 	sha1_init(&c);
 	sha1_update(&c, tree, 20);
 	sha1_update(&c, ctx, 20);
@@ -480,33 +488,26 @@ static void check_tree(struct ck *ck, const unsigned char tree[20], const char *
 	if (!idset_add(&ck->trees_done, key))
 		return;
 	object_read_or_die(tree, &type, &b);
+	if (type != OBJ_TREE)
+		die("expected a tree, found a %s", type_name(type));
 	memcpy(sub_ctx, ctx, 20);
-	for (p = b.p, end = b.p + b.len; p < end;) {
-		const unsigned char *nul = memchr(p, 0, (size_t)(end - p));
-		const char *name = strchr((const char *)p, ' ');
-
-		if (!nul || !name)
-			die("corrupt tree object");
-		if (!ign_dir && !strcmp(name + 1, ".gitignore") && !strncmp((const char *)p, "100", 3)) {
+	for (p = b.p, end = b.p + b.len; tree_next(&p, end, &mode, &name, &eid);) {
+		if (!ign_dir && !strcmp(name, ".gitignore") && (mode & 0170000) == 0100000) {
 			buf gi = { 0 };
 			int t;
 
-			object_read_or_die(nul + 1, &t, &gi);
+			object_read_or_die(eid, &t, &gi);
 			ignore_push_text(&ck->ig, (char *)gi.p, prefix);
 			buf_free(&gi);
 			sha1_init(&c);
 			sha1_update(&c, sub_ctx, 20);
-			sha1_update(&c, nul + 1, 20);
+			sha1_update(&c, eid, 20);
 			sha1_final(&c, sub_ctx);
 		}
-		p = nul + 21;
 	}
-	for (p = b.p; p < end;) {
-		const unsigned char *nul = memchr(p, 0, (size_t)(end - p)), *eid = nul + 1;
-		const char *name = strchr((const char *)p, ' ') + 1;
-		int dir = !strncmp((const char *)p, "40000 ", 6), link = !strncmp((const char *)p, "160000 ", 7);
+	for (p = b.p; tree_next(&p, end, &mode, &name, &eid);) {
+		int dir = mode == 040000, link = mode == 0160000;
 
-		p = nul + 21;
 		path.len = 0;
 		buf_adds(&path, prefix);
 		buf_adds(&path, name);
@@ -527,7 +528,7 @@ static void check_tree(struct ck *ck, const unsigned char tree[20], const char *
 			int ign = ign_dir || ignore_match(&ck->ig, (char *)path.p, 1);
 
 			buf_addc(&path, '/');
-			check_tree(ck, eid, (char *)path.p, ign, sub_ctx, commit);
+			check_tree(ck, eid, (char *)path.p, ign, sub_ctx, commit, depth + 1);
 			continue;
 		}
 		{
@@ -587,7 +588,7 @@ int check_run(const struct objlist *objs, const struct check_ref *refs, size_t n
 
 		if (heads && !ref_allowed(&ck, R_BRANCH, refs[i].name + 11))
 			report(&ck, 1, "branch", NULL, "%s: not a branch name the rules allow (%s)", refs[i].name, ck.file);
-		else if (!heads && !ref_allowed(&ck, R_TAG, refs[i].name + 10))
+		else if (!strncmp(refs[i].name, "refs/tags/", 10) && !ref_allowed(&ck, R_TAG, refs[i].name + 10))
 			report(&ck, 1, "tag", NULL, "%s: not a tag name the rules allow (%s)", refs[i].name, ck.file);
 	}
 	for (i = 0; i < objs->n; i++) {
@@ -615,7 +616,7 @@ int check_run(const struct objlist *objs, const struct check_ref *refs, size_t n
 				check_ident(&ck, label, "committer", h, hl);
 			else
 				report(&ck, 1, "identity", NULL, "%s: no committer", label);
-			check_tree(&ck, c.tree, "", 0, zero, sh);
+			check_tree(&ck, c.tree, "", 0, zero, sh, 0);
 		} else {
 			ntags++;
 			if ((h = header(&b, "tagger ", &hl)))

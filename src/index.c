@@ -211,6 +211,8 @@ int index_read(struct files *out, uint32_t stamp[2])
 			die("%s is corrupt (truncated entry)", path);
 		if (flags & 0x3000)
 			die("the index has unmerged entries; resolve them with git first");
+		if ((flags & 0x4000) && (p[62] & 0x40))
+			die("the index has skip-worktree entries (a sparse checkout), which mgit does not support");
 		mode = get32(p + 24);
 		name = xstrndup((const char *)p + fixed, len);
 		if (mode != 0100644 && mode != 0100755 && mode != 0120000 && mode != 0160000)
@@ -260,7 +262,7 @@ void index_write(const struct files *f)
 	int fd;
 
 	sprintf(lock, "%s.lock", path);
-	fd = open(lock, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0666);
+	fd = lock_take(lock);
 	if (fd < 0 && errno == EEXIST)
 		die("%s exists: another git or mgit is running, or the lock is stale", lock);
 	if (fd < 0)
@@ -302,6 +304,7 @@ void index_write(const struct files *f)
 		die("cannot write %s: %s", lock, strerror(errno));
 	if (rename(lock, path))
 		die("cannot rename %s: %s", lock, strerror(errno));
+	lock_done();
 	buf_free(&b);
 	free(lock);
 	free(path);

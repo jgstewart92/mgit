@@ -200,6 +200,11 @@ static void scan_dir(struct scan *sc, const char *dir, const char *rel, int igno
 		full = path_join(dir, de->d_name);
 		if (lstat(full, &st))
 			die("cannot stat %s: %s", full, strerror(errno));
+		if (name_refused(de->d_name, S_ISLNK(st.st_mode) ? 0120000 : 0)) {
+			warning("skipping %s%s: git refuses that name", rel, de->d_name);
+			free(full);
+			continue;
+		}
 		path.len = 0;
 		buf_adds(&path, rel);
 		buf_adds(&path, de->d_name);
@@ -218,7 +223,7 @@ static void scan_dir(struct scan *sc, const char *dir, const char *rel, int igno
 			}
 			ign = ignored || ignore_match(&sc->ig, (char *)path.p, 1);
 			buf_addc(&path, '/');
-			if (has_git(full))
+			if (has_git(full) && !files_have_prefix(sc->tracked, (char *)path.p))
 				warning("skipping %s: it has its own .git (submodules are not supported)", (char *)path.p);
 			else if (!ign || files_have_prefix(sc->tracked, (char *)path.p))
 				scan_dir(sc, full, (char *)path.p, ign);
@@ -649,9 +654,8 @@ int cmd_checkout(int argc, char **argv)
 		const char *shown = !strncmp(track, "refs/remotes/", 13) ? track + 13 : track;
 
 		ref_update((char *)ref.p, id, NULL);
-		buf_adds(&cfg, "[branch \"");
-		buf_adds(&cfg, argv[1]);
-		buf_adds(&cfg, "\"]\n\tremote = ");
+		config_section(&cfg, "branch", argv[1]);
+		buf_adds(&cfg, "\tremote = ");
 		config_value(&cfg, remote);
 		buf_adds(&cfg, "\n\tmerge = ");
 		config_value(&cfg, (char *)ref.p);

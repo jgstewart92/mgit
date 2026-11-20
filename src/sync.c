@@ -36,25 +36,24 @@ static void write_dst(int type, const buf *b, const unsigned char id[20])
 }
 
 /* Children are written before their tree, so a tree present in the destination is complete. */
-static void copy_tree(const unsigned char id[20])
+static void copy_tree(const unsigned char id[20], int depth)
 {
-	const unsigned char *p, *end;
+	const unsigned char *p, *end, *eid;
+	const char *name;
+	unsigned mode;
 	buf b = { 0 };
 
+	if (depth > TREE_DEPTH_MAX)
+		die("trees are nested more than %d deep", TREE_DEPTH_MAX);
 	if (in_dst(id))
 		return;
 	read_from(src_dir, id, OBJ_TREE, &b);
 	p = b.p;
 	end = b.p + b.len;
-	while (p < end) {
-		const unsigned char *nul = memchr(p, 0, (size_t)(end - p)), *eid;
-
-		if (!nul || end - nul < 21)
-			die("corrupt tree object");
-		eid = nul + 1;
-		if (!strncmp((const char *)p, "40000 ", 6)) {
-			copy_tree(eid);
-		} else if (!strncmp((const char *)p, "160000 ", 7)) {
+	while (tree_next(&p, end, &mode, &name, &eid)) {
+		if (mode == 040000) {
+			copy_tree(eid, depth + 1);
+		} else if (mode == 0160000) {
 			; /* a submodule's commit lives in its own repository */
 		} else if (!in_dst(eid)) {
 			buf blob = { 0 };
@@ -63,7 +62,6 @@ static void copy_tree(const unsigned char id[20])
 			write_dst(OBJ_BLOB, &blob, eid);
 			buf_free(&blob);
 		}
-		p = nul + 21;
 	}
 	write_dst(OBJ_TREE, &b, id);
 	buf_free(&b);
@@ -115,7 +113,7 @@ static void copy_history(const unsigned char tip[20])
 				n++;
 			}
 		} else {
-			copy_tree(c.tree);
+			copy_tree(c.tree, 0);
 			write_dst(OBJ_COMMIT, &b, e->id);
 			idset_add(&done, e->id);
 			n--;
@@ -227,7 +225,7 @@ int push_local(const char *dir, const char *branch)
 	dst_dir = other_repo(dir, &bare);
 	git_dir = dst_dir;
 	head = bare ? NULL : head_symref();
-	if (head && !strcmp(head, ref))
+	if ((head && !strcmp(head, ref)) || checked_out_elsewhere(ref + 11))
 		die("refusing to update %s in %s: it is checked out there (push to a bare repository, or pull from there)",
 		    ref + 11, dir);
 	have_old = ref_read(ref, old) == 0;

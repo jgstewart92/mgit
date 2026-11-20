@@ -27,6 +27,7 @@ struct ident_parts {
 static void ident_split(const char *s, size_t n, struct ident_parts *ip)
 {
 	const char *gt = NULL, *lt = memchr(s, '<', n), *p, *end = s + n;
+	int digits;
 
 	memset(ip, 0, sizeof *ip);
 	for (p = s; p < end; p++)
@@ -45,11 +46,16 @@ static void ident_split(const char *s, size_t n, struct ident_parts *ip)
 		;
 	if (p == end || *p < '0' || *p > '9')
 		return;
-	for (; p < end && *p >= '0' && *p <= '9'; p++)
-		ip->secs = ip->secs * 10 + (*p - '0');
+	for (digits = 0; p < end && *p >= '0' && *p <= '9'; p++, digits++)
+		if (digits < 18)
+			ip->secs = ip->secs * 10 + (*p - '0');
 	if (end - p != 6 || p[0] != ' ' || (p[1] != '+' && p[1] != '-'))
 		return;
 	ip->zone = p + 1;
+	if (digits > 18) {
+		ip->secs = 0;	/* as git shows a date too large to hold: the epoch, in UTC */
+		ip->zone = "+0000";
+	}
 	ip->have_date = 1;
 }
 

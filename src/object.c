@@ -89,8 +89,21 @@ void object_write(int type, const void *data, size_t n, unsigned char id[20])
 	free(path);
 }
 
-/* Returns -1 if the object is absent; dies if it is present but corrupt. out receives the content. */
-int object_read(const unsigned char id[20], int *type, buf *out)
+/* Dies unless the content hashes to id. */
+void object_check(const unsigned char id[20], int type, const buf *b)
+{
+	unsigned char check[20];
+	char hex[41];
+
+	object_hash(type, b->p, b->len, check);
+	if (memcmp(check, id, 20)) {
+		id_to_hex(id, hex);
+		die("corrupt packed object %s: hash mismatch", hex);
+	}
+}
+
+/* Returns -1 if no loose object has this id; dies if one does but is corrupt. out receives the content. */
+int loose_read(const unsigned char id[20], int *type, buf *out)
 {
 	char *path = object_path(id);
 	buf z = { 0 }, raw = { 0 };
@@ -104,16 +117,7 @@ int object_read(const unsigned char id[20], int *type, buf *out)
 			die("cannot read %s: %s", path, strerror(errno));
 		free(path);
 		buf_free(&z);
-		if (pack_read(id, type, out))
-			return -1;
-		object_hash(*type, out->p, out->len, check);
-		if (memcmp(check, id, 20)) {
-			char hex[41];
-
-			id_to_hex(id, hex);
-			die("corrupt packed object %s: hash mismatch", hex);
-		}
-		return 0;
+		return -1;
 	}
 	if (zlib_inflate(&raw, z.p, z.len))
 		die("corrupt object %s: bad zlib stream", path);
@@ -143,6 +147,17 @@ int object_read(const unsigned char id[20], int *type, buf *out)
 	*out = raw;
 	*type = t;
 	free(path);
+	return 0;
+}
+
+/* Returns -1 if the object is absent; dies if it is present but corrupt. out receives the content. */
+int object_read(const unsigned char id[20], int *type, buf *out)
+{
+	if (!loose_read(id, type, out))
+		return 0;
+	if (pack_read(id, type, out))
+		return -1;
+	object_check(id, *type, out);
 	return 0;
 }
 

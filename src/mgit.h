@@ -1,7 +1,7 @@
 #ifndef MGIT_H
 #define MGIT_H
 
-#define MGIT_VERSION "6.1.1"
+#define MGIT_VERSION "6.1.5"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -67,6 +67,8 @@ struct repo_state {
 /* util.c */
 void die(const char *fmt, ...) __attribute__((noreturn, format(printf, 1, 2)));
 void warning(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+void notice(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+void remote_putc(unsigned char c);
 void *xmalloc(size_t n);
 void *xrealloc(void *p, size_t n);
 char *xstrdup(const char *s);
@@ -76,6 +78,7 @@ void buf_grow(buf *b, size_t extra);
 void buf_add(buf *b, const void *d, size_t n);
 void buf_addc(buf *b, int c);
 void buf_adds(buf *b, const char *s);
+void buf_add_masked(buf *b, const char *s);
 void buf_printf(buf *b, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 void buf_quote(buf *b, const char *prefix, const char *path);
 void buf_free(buf *b);
@@ -101,12 +104,12 @@ void sha1_final(sha1_ctx *c, unsigned char out[20]);
 void zlib_store(buf *out, const unsigned char *in, size_t n);
 void zlib_compress(buf *out, const unsigned char *in, size_t n);
 int zlib_inflate(buf *out, const unsigned char *in, size_t n);
-int zlib_inflate_prefix(buf *out, const unsigned char *in, size_t n, size_t *used);
+int zlib_inflate_prefix(buf *out, const unsigned char *in, size_t n, size_t max, size_t *used);
 
 /* pack.c */
 struct objlist;
 int pack_verify(const char *idx_path, const struct objlist *want);
-void pack_index(const char *tmp, struct objlist *out);
+char *pack_index(const char *tmp, struct objlist *out);
 void pack_unmap_all(void);
 int pack_read(const unsigned char id[20], int *type, buf *out);
 int pack_has(const unsigned char id[20]);
@@ -119,6 +122,8 @@ int type_from_name(const char *s, size_t n);
 void object_hash(int type, const void *d, size_t n, unsigned char id[20]);
 void object_write(int type, const void *d, size_t n, unsigned char id[20]);
 int object_read(const unsigned char id[20], int *type, buf *out);
+int loose_read(const unsigned char id[20], int *type, buf *out);
+void object_check(const unsigned char id[20], int type, const buf *b);
 void object_read_or_die(const unsigned char id[20], int *type, buf *out);
 int object_exists(const unsigned char id[20]);
 int object_by_prefix(const char *hex, size_t n, unsigned char id[20]);
@@ -143,6 +148,11 @@ void head_set_symref(const char *ref);
 void symref_set(const char *name, const char *target);
 char **config_get_all(const char *section, const char *sub, const char *key, size_t *count);
 void ref_update(const char *name, const unsigned char new_id[20], const unsigned char *old_id);
+enum { DOOM_LOCK, DOOM_PACK, DOOM_IDX };
+void remove_if_killed(int slot, const char *path);
+int lock_take(const char *path);
+void lock_done(void);
+void lock_drop(void);
 void reflog_append(const char *name, const unsigned char *old_id, const unsigned char new_id[20], const char *ident,
 		   size_t ident_len, const char *msg);
 void peel_to_commit(unsigned char id[20]);
@@ -179,8 +189,12 @@ int wildmatch(const char *pat, const char *text, int pathname);
 
 /* tree.c */
 void tree_build(const struct files *f, unsigned char id[20]);
+/* Trees nested deeper than this are refused, as git refuses them (core.maxTreeDepth), before they can exhaust the stack. */
+#define TREE_DEPTH_MAX 2048
 void tree_flatten(const unsigned char tree[20], struct files *out);
 void tree_print(const buf *b);
+int tree_next(const unsigned char **pp, const unsigned char *end, unsigned *mode, const char **name, const unsigned char **id);
+int name_refused(const char *name, unsigned mode);
 
 /* worktree.c */
 void state_load(struct repo_state *s);
@@ -250,6 +264,7 @@ int cmd_tag(int argc, char **argv);
 int cmd_remote(int argc, char **argv);
 char *remote_url(const char *name, int push);
 void config_value(buf *b, const char *v);
+void config_section(buf *b, const char *section, const char *sub);
 
 /* transport.c: pkt-lines, urls, advertised refs, ssh and curl as subprocesses */
 enum { URL_LOCAL, URL_SSH, URL_HTTP };

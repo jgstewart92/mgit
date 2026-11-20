@@ -169,6 +169,9 @@ static int delta_make(const struct dindex *x, const unsigned char *trg, size_t t
 	size_t i = 0, lit = 0;
 	uint64_t h = 0, m15 = hm15();
 
+	/* a copy carries 4 offset bytes: past 4 GiB of source the delta would rebuild the wrong object (a proved bound) */
+	if (x->n > 0xffffffffu)
+		return -1;
 	out->len = 0;
 	put_size(out, x->n);
 	put_size(out, tn);

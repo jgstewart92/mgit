@@ -83,10 +83,16 @@ static const char *short_name(const char *ref)
 	return !strncmp(ref, "refs/heads/", 11) ? ref + 11 : !strncmp(ref, "refs/tags/", 10) ? ref + 10 : ref;
 }
 
+/* why may come from the far side (a report-status "ng" reason): its control characters are shown, not sent */
 static void show(const struct update *u, const char *flag, const char *what, const char *why)
 {
-	printf(" %s %-17s %s -> %s%s%s%s\n", flag, what, short_name(u->src), short_name(u->dst), why ? " (" : "", why ? why : "",
-	       why ? ")" : "");
+	buf w = { 0 };
+
+	if (why)
+		buf_add_masked(&w, why);
+	printf(" %s %-17s %s -> %s%s%s%s\n", flag, what, short_name(u->src), short_name(u->dst), why ? " (" : "",
+	       why ? (char *)w.p : "", why ? ")" : "");
+	buf_free(&w);
 }
 
 static void show_sent(const struct update *u, int tag)
@@ -115,7 +121,7 @@ static void remote_says(const unsigned char *p, size_t n, int *at_start)
 			fputs("remote: ", stderr);
 			*at_start = 0;
 		}
-		fputc(p[i], stderr);
+		remote_putc(p[i]);
 		if (p[i] == '\n' || p[i] == '\r')
 			*at_start = 1;
 	}

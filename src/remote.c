@@ -36,6 +36,18 @@ void config_value(buf *b, const char *v)
 		buf_addc(b, '"');
 }
 
+/* A section header [section "sub"] as git writes one, with " and \ in sub escaped. */
+void config_section(buf *b, const char *section, const char *sub)
+{
+	buf_printf(b, "[%s \"", section);
+	for (; *sub; sub++) {
+		if (*sub == '"' || *sub == '\\')
+			buf_addc(b, '\\');
+		buf_addc(b, *sub);
+	}
+	buf_adds(b, "\"]\n");
+}
+
 static const char remote_usage[] = "usage: mgit remote [-v], or mgit remote add <name> <url>";
 
 int cmd_remote(int argc, char **argv)

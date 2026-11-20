@@ -11,10 +11,18 @@ struct pattern {
 
 /*
  * Git's wildmatch for the forms .gitignore uses: '*', '?', '[...]' (with '!' or '^', ranges and '\'
- * escapes; no [:class:] names) and, when pathname is set, "**" as a whole path component.
+ * escapes; no [:class:] names) and, when pathname is set, "**" as a whole path component. Returns 1 on a match, 0 on
+ * none, and -1 when no other reading of the pattern can match either, as git's WM_ABORT_ALL: a '*' that ran to the end of
+ * the text, or a pattern deeper than WM_DEPTH_MAX. Each wildcard costs a frame and a .gitignore line can be any length.
  */
-static int wm(const char *pat, const char *p, const char *t, int pathname)
+enum { WM_DEPTH_MAX = 4096 };
+
+static int wm(const char *pat, const char *p, const char *t, int pathname, int depth)
 {
+	int r;
+
+	if (depth > WM_DEPTH_MAX)
+		return -1;
 	for (; *p; p++, t++) {
 		const char *q;
 
@@ -35,20 +43,22 @@ static int wm(const char *pat, const char *p, const char *t, int pathname)
 				if (pathname && (q == pat || q[-1] == '/') && (!p[1] || p[1] == '/')) {
 					if (!p[1])
 						return 1;
-					if (wm(pat, p + 2, t, pathname))
-						return 1;
+					if ((r = wm(pat, p + 2, t, pathname, depth + 1)))
+						return r;
 					for (; *t; t++)
-						if (*t == '/' && wm(pat, p + 2, t + 1, pathname))
-							return 1;
+						if (*t == '/' && (r = wm(pat, p + 2, t + 1, pathname, depth + 1)))
+							return r;
 					return 0;
 				}
 			}
 			if (!p[1])
 				return !pathname || !strchr(t, '/');
 			for (;; t++) {
-				if (wm(pat, p + 1, t, pathname))
-					return 1;
-				if (!*t || (pathname && *t == '/'))
+				if ((r = wm(pat, p + 1, t, pathname, depth + 1)))
+					return r;
+				if (!*t)
+					return -1;
+				if (pathname && *t == '/')
 					return 0;
 			}
 		case '[': {
@@ -95,7 +105,7 @@ static int wm(const char *pat, const char *p, const char *t, int pathname)
 
 int wildmatch(const char *pat, const char *text, int pathname)
 {
-	return wm(pat, pat, text, pathname);
+	return wm(pat, pat, text, pathname, 0) == 1;
 }
 
 static void add_patterns(struct ignore *ig, const char *text, const char *base)

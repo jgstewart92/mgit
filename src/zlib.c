@@ -69,6 +69,7 @@ struct state {
 	uint32_t bitbuf;
 	int bitcnt;
 	buf *out;
+	size_t start, max;	/* out held start bytes before this stream, which may add at most max */
 	int err;	/* set once the stream is found bad; sticky, and every loop that decodes checks it */
 };
 
@@ -188,6 +189,8 @@ static void codes(struct state *s, const struct huff *lencode, const struct huff
 		if (sym < 0)
 			{ s->err = 1; return; }
 		if (sym < 256) {
+			if (out->len - s->start >= s->max)
+				{ s->err = 1; return; }
 			if (out->len + 2 > out->cap)
 				buf_grow(out, 1);
 			out->p[out->len++] = (unsigned char)sym;
@@ -208,7 +211,7 @@ static void codes(struct state *s, const struct huff *lencode, const struct huff
 		dist = (size_t)(dbase[sym] + bits(s, dext[sym]));
 		if (s->err)
 			return;
-		if (dist > out->len)
+		if (dist > out->len - s->start || len > s->max - (out->len - s->start))
 			{ s->err = 1; return; }
 		buf_grow(out, len);
 		{
@@ -238,7 +241,7 @@ static void stored(struct state *s)
 	if (s->in[s->pos + 2] != (~len & 0xff) || s->in[s->pos + 3] != ((~len >> 8) & 0xff))
 		{ s->err = 1; return; }
 	s->pos += 4;
-	if (s->inlen - s->pos < len)
+	if (s->inlen - s->pos < len || len > s->max - (s->out->len - s->start))
 		{ s->err = 1; return; }
 	buf_add(s->out, s->in + s->pos, len);
 	s->pos += len;
@@ -331,11 +334,12 @@ int zlib_inflate(buf *out, const unsigned char *in, size_t n)
 {
 	size_t used;
 
-	return zlib_inflate_prefix(out, in, n, &used) || used != n ? -1 : 0;
+	return zlib_inflate_prefix(out, in, n, SIZE_MAX, &used) || used != n ? -1 : 0;
 }
 
-/* The same for a stream that may be followed by other data, as in a pack; used is the stream's length. */
-int zlib_inflate_prefix(buf *out, const unsigned char *in, size_t n, size_t *used)
+/* The same for a stream that may be followed by other data, as in a pack, and that may give at most max bytes (it
+ * fails as soon as it would give more); used is the stream's length. */
+int zlib_inflate_prefix(buf *out, const unsigned char *in, size_t n, size_t max, size_t *used)
 {
 	struct state s;
 	size_t start = out->len;
@@ -350,6 +354,8 @@ int zlib_inflate_prefix(buf *out, const unsigned char *in, size_t n, size_t *use
 	s.bitbuf = 0;
 	s.bitcnt = 0;
 	s.out = out;
+	s.start = start;
+	s.max = max;
 	s.err = 0;
 	do {
 		last = bits(&s, 1);

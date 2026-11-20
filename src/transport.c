@@ -199,8 +199,11 @@ void advert_read(int fd, struct advert *a)
 			if ((fmt = cap_value(a->caps, "object-format", "")) && strcmp(fmt, "sha1"))
 				die("the remote repository uses %s object names; mgit works with SHA-1 repositories only", fmt);
 			free(fmt);
-			if (!a->head)
-				a->head = cap_value(a->caps, "symref", "HEAD:");
+			if (!a->head && (a->head = cap_value(a->caps, "symref", "HEAD:")) &&
+			    (strncmp(a->head, "refs/heads/", 11) || !refname_ok(a->head))) {
+				free(a->head);	/* a HEAD that names no branch is passed over, as git passes over a bad symref */
+				a->head = NULL;
+			}
 		}
 		first = 0;
 		if (line.len >= 8 && !memcmp(line.p, "shallow ", 8))
@@ -368,8 +371,10 @@ pid_t http_start(const char *url, const buf *body, const char *type, int *from)
 	args[n++] = "--show-error";
 	args[n++] = "--proto";
 	args[n++] = "=http,https";
+	args[n++] = "--globoff";			/* a url is taken as written: no [..] or {..} ranges */
 	args[n++] = "--dump-header";
 	args[n++] = "-";
+	args[n++] = "--suppress-connect-headers";	/* through a proxy, only the server's own headers */
 	args[n++] = "--user-agent";
 	args[n++] = "mgit/" MGIT_VERSION;
 	if (body) {

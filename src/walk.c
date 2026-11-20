@@ -112,21 +112,17 @@ void walk(const unsigned char (*tips)[20], size_t ntips, struct idset *seen, str
 				objlist_add(out, o.id, type);
 			objlist_add(&todo, target, 0);
 		} else if (type == OBJ_TREE) {
-			const unsigned char *p = b.p, *end = b.p + b.len;
+			const unsigned char *p = b.p, *end = b.p + b.len, *eid;
+			const char *name;
+			unsigned mode;
 
 			if (out)
 				objlist_add(&trees, o.id, type);
-			while (p < end) {
-				const unsigned char *nul = memchr(p, 0, (size_t)(end - p));
-
-				if (!nul || end - nul < 21)
-					die("corrupt tree object");
-				if (!strncmp((const char *)p, "40000 ", 6))
-					objlist_add(&todo, nul + 1, OBJ_TREE);
-				else if (strncmp((const char *)p, "160000 ", 7))
-					objlist_add(&todo, nul + 1, OBJ_BLOB);
-				p = nul + 21;
-			}
+			while (tree_next(&p, end, &mode, &name, &eid))
+				if (mode == 040000)
+					objlist_add(&todo, eid, OBJ_TREE);
+				else if (mode != 0160000)
+					objlist_add(&todo, eid, OBJ_BLOB);
 		} else if (out) {
 			objlist_add(&blobs, o.id, type);
 		}
@@ -165,7 +161,7 @@ int descends(const unsigned char tip[20], const unsigned char anc[20])
 		if (type == OBJ_TAG) {
 			unsigned char t[20];
 
-			if (!hex_to_id((char *)b.p + 7, t))
+			if (b.len >= 47 && !memcmp(b.p, "object ", 7) && !hex_to_id((char *)b.p + 7, t))
 				objlist_add(&todo, t, 0);
 		} else if (type == OBJ_COMMIT) {
 			commit_parse(&b, &c);

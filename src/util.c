@@ -9,16 +9,67 @@
 #include <string.h>
 #include <unistd.h>
 
+/* Whether c is shown as ^X, as git shows a control character a far side sends (newline, CR and tab are not). */
+static int shown_masked(unsigned char c)
+{
+	return (c < 0x20 && c != '\n' && c != '\r' && c != '\t') || c == 0x7f;
+}
+
+/* One byte to stderr, a control character as ^X. */
+void remote_putc(unsigned char c)
+{
+	if (shown_masked(c)) {
+		fputc('^', stderr);
+		fputc(c ^ 0x40, stderr);
+	} else {
+		fputc(c, stderr);
+	}
+}
+
+/* s appended to b, each control character as ^X: for text from elsewhere printed on stdout. */
+void buf_add_masked(buf *b, const char *s)
+{
+	buf_adds(b, "");
+	for (; *s; s++) {
+		if (shown_masked((unsigned char)*s)) {
+			buf_addc(b, '^');
+			buf_addc(b, *s ^ 0x40);
+		} else {
+			buf_addc(b, *s);
+		}
+	}
+}
+
+/* A message on stderr after pre; what it quotes from a far side may hold any byte, so control characters are shown. */
+static void say(const char *pre, const char *fmt, va_list ap)
+{
+	va_list aq;
+	char *s;
+	int n, i;
+
+	fflush(stdout);
+	fputs(pre, stderr);
+	va_copy(aq, ap);
+	n = vsnprintf(NULL, 0, fmt, aq);
+	va_end(aq);
+	if (n >= 0 && (s = malloc((size_t)n + 1))) {
+		vsnprintf(s, (size_t)n + 1, fmt, ap);
+		for (i = 0; i < n; i++)
+			remote_putc((unsigned char)s[i]);
+		free(s);
+	} else {
+		vfprintf(stderr, fmt, ap);
+	}
+	fputc('\n', stderr);
+}
+
 void die(const char *fmt, ...)
 {
 	va_list ap;
 
-	fflush(stdout);
-	fputs("mgit: ", stderr);
 	va_start(ap, fmt);
-	vfprintf(stderr, fmt, ap);
+	say("mgit: ", fmt, ap);
 	va_end(ap);
-	fputc('\n', stderr);
 	exit(128);
 }
 
@@ -26,12 +77,18 @@ void warning(const char *fmt, ...)
 {
 	va_list ap;
 
-	fflush(stdout);
-	fputs("mgit: warning: ", stderr);
 	va_start(ap, fmt);
-	vfprintf(stderr, fmt, ap);
+	say("mgit: warning: ", fmt, ap);
 	va_end(ap);
-	fputc('\n', stderr);
+}
+
+void notice(const char *fmt, ...)
+{
+	va_list ap;
+
+	va_start(ap, fmt);
+	say("mgit: notice: ", fmt, ap);
+	va_end(ap);
 }
 
 void *xmalloc(size_t n)

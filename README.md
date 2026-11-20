@@ -4,7 +4,7 @@ mgit is a small subset of git written in C, with no library beyond the C library
 on-disk format (SHA-1 objects, loose and packed, the index, refs, packed-refs, the reflog, config), so a repository
 mgit makes is an ordinary git repository and git can take over at any point; mgit reads what git writes in the same
 way. It covers the local work of one person on one branch at a time, and moving that work to and from a server over
-ssh, https or a local path. This is mgit 6.1.1; `mgit --version` prints a build's version.
+ssh, https or a local path. This is mgit 6.1.5; `mgit --version` prints a build's version.
 
 ## What it does
 
@@ -56,8 +56,10 @@ ssh, https or a local path. This is mgit 6.1.1; `mgit --version` prints a build'
 
 ## The pre-push check
 
-Every `mgit push` first checks what it would send, before it connects, and sends nothing if any rule fails; `mgit
-check [<rev>]` runs the same check alone. The rules are in a plain text file read again on every run: `$XDG_CONFIG_HOME/mgit/check.conf`
+Every `mgit push` over ssh first checks what it would send, before it connects, and sends nothing if any rule fails; `mgit
+check [<rev>]` runs the same check alone. A push to a path on this machine (a plain path, `file://`, or a remote whose url
+is one) is not checked: it copies objects between two repositories here; run `mgit check` first when that path is a
+share whose contents leave the machines you trust. The rules are in a plain text file read again on every run: `$XDG_CONFIG_HOME/mgit/check.conf`
 (`.config/mgit/check.conf` in your home directory when `XDG_CONFIG_HOME` is unset) if it exists, else the shipped
 `check.conf` as installed. The shipped file refuses keys and tokens by their published shapes, passwords written into
 code or urls, email addresses other than placeholders and GitHub's private addresses, branches other than `main`, tags
@@ -76,10 +78,28 @@ pointer and a submodule entry, whose content a push does not carry.
 - Force pushes, deleting remote refs, and moving a tag that already exists on the far side.
 - Non-fast-forward pulls and pushes: there is no merge and no rebase.
 - SHA-256 repositories.
+- Delta chains of more than 10000 deltas (git writes at most 4095) and delta cycles: such an object reads as corrupt.
+- Trees nested more than 2048 below the root, git's own limit.
 - https with credentials: a url with a user name or password is refused.
+- A commit while git is in the middle of a merge, cherry-pick, revert or rebase, and an index with skip-worktree
+  entries (a sparse checkout); a fetch that would move a branch that is checked out, here or in a linked worktree.
+- Names git refuses in a path: `.git` in any case, and as NTFS reads it (`git~1`, `.git` followed by dots or spaces, up
+  to the end, a `:` or a `\`, also after any `\`), and a symlink named `.gitmodules`. Commit skips them with a warning,
+  as it skips a directory that holds its own `.git` and no tracked file; checkout and clone refuse a tree that holds
+  one. As with git on Linux, HFS+'s ignorable characters (`.g\u200cit`) and a symlink named `.gitattributes` are taken,
+  though `git fsck --strict` on a receiving side refuses them.
 - Not built: shallow clones, thin packs on fetch, protocol v2, following redirects, automatic gc, submodule fetch, LFS and
   attributes (a clone that meets submodules, LFS pointers or `.gitattributes` says so), idx v1, alternates and
   promisor clones. Packs over 2 GiB are untested.
+- Open, as of 6.1.5 (two outside reviews; the inputs are in its claims table):
+  - SHA-1 without collision detection: the known colliding pairs that git (SHA-1DC) refuses are taken.
+  - A pack's REF_DELTA chains are rebuilt one level per pass over the whole pack, so a deep chain from a far side costs
+    CPU in proportion to its depth times the pack's size (MEASURED: 8000 deltas, 5 s; git index-pack, 20 ms).
+  - As with git, a small pack can state and build a large object: a 16 KB pack of one 16 MiB base and a delta of
+    copies built 512 MiB (MEASURED peak RSS 531 MiB, git index-pack the same).
+  - A fetched pack not yet checked for connectivity is removed on exit, a die, SIGINT, SIGTERM or SIGHUP, not on
+    SIGKILL or power loss.
+  - https needs a curl that knows `--suppress-connect-headers` (7.54 or later, by curl's manual; 8.23 tested).
 
 ## Build
 
@@ -102,5 +122,6 @@ writes. It needs git itself as the reference (`/usr/bin/git`, with `git-upload-p
 usual POSIX tools. The network parts run against stand-in `ssh` and `curl` scripts that serve one made-up host from
 local repositories and refuse every other host, so nothing leaves the machine. `MGIT=/path/to/mgit ./test.sh` tests
 another build; `MGIT_TEST_ROWS=1` also prints every passing row. It ends with `pass N  fail 0`; on Linux with git
-2.56 it runs 791 checks in about 90 seconds (one of them builds a small driver around `src/pack.c`, so it needs a C
-compiler as the build does).
+2.56 it runs 857 checks in about 35 seconds (MEASURED 2026-11-20 on the development machine; some rows build small drivers
+around `src/`, so it needs a C compiler as the build does). One row inflates a 256 MiB blob under a 400 MB
+address-space limit, which an AddressSanitizer build cannot start under.

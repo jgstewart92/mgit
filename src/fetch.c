@@ -5,7 +5,6 @@
 #include <errno.h>
 #include <limits.h>
 #include <signal.h>
-#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,7 +32,7 @@ struct source {
 	char *dir;		/* a path: the other repository's git directory */
 };
 
-static char *tmp_pack;		/* a pack being received, removed at exit unless pack_index took it */
+static char *tmp_pack;		/* a pack being received, then indexed: removed at exit until what it brings is known to connect */
 static int tmp_fd = -1;		/* open while it is being written */
 
 static void tmp_cleanup(void)
@@ -42,8 +41,14 @@ static void tmp_cleanup(void)
 		close(tmp_fd);
 	tmp_fd = -1;
 	if (tmp_pack) {
+		size_t n = strlen(tmp_pack);
+
 		pack_unmap_all();	/* first: on NFS a removed file still open or mapped stays as .nfsXXXX */
 		unlink(tmp_pack);
+		if (n > 5 && !strcmp(tmp_pack + n - 5, ".pack")) {
+			strcpy(tmp_pack + n - 5, ".idx");
+			unlink(tmp_pack);
+		}
 	}
 }
 
@@ -360,6 +365,7 @@ static char *tmp_pack_open(int *fd)
 	if ((*fd = mkstemp(tmp_pack)) < 0)
 		die("cannot create %s: %s", tmp_pack, strerror(errno));
 	tmp_fd = *fd;
+	remove_if_killed(DOOM_PACK, tmp_pack);
 	free(dir);
 	return tmp_pack;
 }
@@ -367,6 +373,7 @@ static char *tmp_pack_open(int *fd)
 static void tmp_pack_done(int fd, struct objlist *fresh)
 {
 	int bad = fsync(fd) != 0, e = errno;
+	char *kept;
 
 	if (close(fd) && !bad) {
 		bad = 1;
@@ -375,9 +382,13 @@ static void tmp_pack_done(int fd, struct objlist *fresh)
 	tmp_fd = -1;
 	if (bad)
 		die("cannot write %s: %s", tmp_pack, strerror(e));
-	pack_index(tmp_pack, fresh);
+	kept = pack_index(tmp_pack, fresh);
 	free(tmp_pack);
-	tmp_pack = NULL;
+	tmp_pack = kept;	/* still removed at exit, until check_connected has followed what it holds */
+	if (!kept) {
+		remove_if_killed(DOOM_PACK, NULL);
+		remove_if_killed(DOOM_IDX, NULL);
+	}
 }
 
 /* The pack that follows the last ACK or NAK: in side-band packets (band 1 the pack, 2 progress, 3 an error) or raw. */
@@ -395,7 +406,8 @@ static void recv_pack(int fd, int band, struct objlist *fresh)
 			if (b.p[0] == 1)
 				write_all(out, b.p + 1, b.len - 1, tmp_pack);
 			else if (b.p[0] == 2)
-				fwrite(b.p + 1, 1, b.len - 1, stderr);
+				for (size_t k = 1; k < b.len; k++)
+					remote_putc(b.p[k]);
 			else if (b.p[0] == 3)
 				die("the remote reported an error: %.*s", (int)(b.len - 1 - (b.p[b.len - 1] == '\n')), (char *)b.p + 1);
 			else
@@ -516,19 +528,15 @@ static void push_links(const buf *b, int type, struct objlist *todo)
 			die("corrupt tag object");
 		objlist_add(todo, target, 0);
 	} else if (type == OBJ_TREE) {
-		const unsigned char *p = b->p, *end = b->p + b->len;
+		const unsigned char *p = b->p, *end = b->p + b->len, *eid;
+		const char *name;
+		unsigned mode;
 
-		while (p < end) {
-			const unsigned char *nul = memchr(p, 0, (size_t)(end - p));
-
-			if (!nul || end - nul < 21)
-				die("corrupt tree object");
-			if (!strncmp((const char *)p, "40000 ", 6))
-				objlist_add(todo, nul + 1, OBJ_TREE);
-			else if (strncmp((const char *)p, "160000 ", 7))
-				objlist_add(todo, nul + 1, OBJ_BLOB);
-			p = nul + 21;
-		}
+		while (tree_next(&p, end, &mode, &name, &eid))
+			if (mode == 040000)
+				objlist_add(todo, eid, OBJ_TREE);
+			else if (mode != 0160000)
+				objlist_add(todo, eid, OBJ_BLOB);
 	}
 }
 
@@ -636,6 +644,10 @@ static void check_connected(const struct objlist *fresh, const unsigned char (*t
 	idset_free(&in);
 	idset_free(&seen);
 	free(todo.v);
+	free(tmp_pack);	/* connected: the pack is kept */
+	tmp_pack = NULL;
+	remove_if_killed(DOOM_PACK, NULL);
+	remove_if_killed(DOOM_IDX, NULL);
 }
 
 /* ---- refs ---- */
@@ -760,7 +772,7 @@ int fetch_remote(const char *name)
 	struct fupd *up;
 	struct objlist fresh = { 0 };
 	unsigned char (*want)[20], (*tips)[20];
-	char *url = remote_url(name, 0);
+	char *url = remote_url(name, 0), *head = head_symref();
 	size_t nsp, i, k, nup = 0, nwant = 0;
 	int rejected = 0;
 
@@ -833,6 +845,12 @@ int fetch_remote(const char *name)
 				what = "[rejected]";
 				why = "non-fast-forward";
 			}
+		}
+		if ((head && !strcmp(u->dst, head)) ||
+		    (!strncmp(u->dst, "refs/heads/", 11) && checked_out_elsewhere(u->dst + 11))) {
+			flag = "!";	/* as git: the working tree would not follow it */
+			what = "[rejected]";
+			why = "checked out here";
 		}
 		if (*flag == '!')
 			rejected = 1;
@@ -922,26 +940,12 @@ static size_t attr_scan(const buf *b, const char *path, buf *list)
 						break;
 					}
 				}
-				q += tl;
+				q += tl ? tl : 1;	/* a NUL ends no token: step over it */
 			}
 		}
 		p = nl + 1;
 	}
 	return hits;
-}
-
-static void notice(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
-
-static void notice(const char *fmt, ...)
-{
-	va_list ap;
-
-	fflush(stdout);
-	fputs("mgit: notice: ", stderr);
-	va_start(ap, fmt);
-	vfprintf(stderr, fmt, ap);
-	va_end(ap);
-	fputc('\n', stderr);
 }
 
 /* For the entries of to that from does not hold as they are: submodules, LFS pointers and attributes, each said once. */
@@ -1105,7 +1109,7 @@ static const struct remote_ref *default_branch(const struct advert *a)
 		if ((r = advert_find(a, pref[i])) && !memcmp(r->id, head->id, 20))
 			return r;
 	for (i = 0; i < a->n; i++)
-		if (!strncmp(a->v[i].name, "refs/heads/", 11) && !memcmp(a->v[i].id, head->id, 20))
+		if (!strncmp(a->v[i].name, "refs/heads/", 11) && !memcmp(a->v[i].id, head->id, 20) && refname_ok(a->v[i].name))
 			return &a->v[i];
 	return NULL;
 }
@@ -1186,9 +1190,8 @@ int cmd_clone(int argc, char **argv)
 		ref_update(branch->name, branch->id, NULL);
 		head_set_symref(branch->name);
 		b.len = 0;
-		buf_adds(&b, "[branch \"");
-		buf_adds(&b, name);
-		buf_adds(&b, "\"]\n\tremote = origin\n\tmerge = ");
+		config_section(&b, "branch", name);
+		buf_adds(&b, "\tremote = origin\n\tmerge = ");
 		config_value(&b, branch->name);
 		buf_adds(&b, "\n");
 		config_append((char *)b.p);
@@ -1198,7 +1201,9 @@ int cmd_clone(int argc, char **argv)
 		warning("the remote's HEAD is no branch; HEAD is detached at its commit");
 		clone_checkout(head->id);
 	} else {
-		if (s.adv.head && strcmp(s.adv.head, "refs/heads/main") && refname_ok(s.adv.head))
+		/* as git: an unborn HEAD is taken only as a branch */
+		if (s.adv.head && !strncmp(s.adv.head, "refs/heads/", 11) && strcmp(s.adv.head, "refs/heads/main") &&
+		    refname_ok(s.adv.head))
 			head_set_symref(s.adv.head);
 		if (!s.adv.n)
 			warning("you appear to have cloned an empty repository");
